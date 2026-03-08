@@ -2,49 +2,32 @@
  * ============================================
  * File: src/hooks/log-hook.ts
  * ============================================
- * Creation Reason: Collect conversation turns during the session and flush
- *   them to MemChain's /log endpoint when the session ends. The /log rule
- *   engine auto-extracts identities, preferences, allergies (P0-P6 patterns)
- *   and detects negative feedback ("wrong", "搞错了") for memory correction.
+ * Creation Reason: Collect conversation turns during session and flush
+ *   to MemChain /log on session end. Rule engine auto-extracts identities,
+ *   preferences, allergies, and detects negative feedback.
  *
  * Main Functionality:
- *   - Hook "message:preprocessed" → collect each user message as a turn
- *   - Hook "session:end" → batch-send all turns to MemChain /log
+ *   - Hook "message:preprocessed" → collect user message turns
+ *   - Hook "session:end" → batch-send turns to MemChain /log
  *   - Include recall_context for negative feedback correlation
- *   - Graceful cleanup of session state after logging
  *
  * Dependencies:
- *   - src/core/client.ts (MemChainClient.log)
+ *   - src/core/client.ts (MemChainClient)
  *   - src/core/session-store.ts (SessionStore)
- *   - src/types/memchain.ts (MemChainPluginConfig)
- *   - OpenClaw Plugin SDK: api.registerHook()
- *
- * Main Logical Flow:
- *   1. message:preprocessed fires for each inbound message
- *   2. Extract user content (text or transcribed audio)
- *   3. Store as turn in SessionStore
- *   4. session:end fires when conversation terminates
- *   5. Retrieve all turns + recall_context from SessionStore
- *   6. POST /api/mpi/log with turns + recall_context
- *   7. Clear session state to free memory
+ *   - src/types/memchain.ts (MemChainPluginConfig, Memory)
  *
  * ⚠️ Important Note for Next Developer:
  *   - /log is the SAFETY NET — even if remember-tool isn't called,
  *     the rule engine extracts memories from raw conversation
- *   - recall_context is optional but HIGHLY recommended — without it,
- *     negative feedback detection can't identify which memory was wrong
- *   - session:end may not fire in all cases (e.g. gateway crash) —
- *     SessionStore's TTL cleanup handles orphaned sessions
- *   - Assistant messages are also collected to give the rule engine
- *     full conversation context for P3 (correction) detection
+ *   - recall_context enables negative feedback detection
  *
- * Last Modified: v0.1.0 - Initial creation
+ * Last Modified: v0.1.0-fix1 — Fixed: correct imports, typed map() parameter
  * ============================================
  */
 
 import type { MemChainClient } from "../core/client.js";
 import type { SessionStore } from "../core/session-store.js";
-import type { MemChainPluginConfig } from "../types/memchain.js";
+import type { MemChainPluginConfig, Memory } from "../types/memchain.js";
 
 /** Minimal logger interface */
 interface PluginLogger {
@@ -53,10 +36,6 @@ interface PluginLogger {
   debug(msg: string, meta?: Record<string, unknown>): void;
 }
 
-/**
- * OpenClaw hook event structure.
- * Fields vary by event type — we use the union of what we need.
- */
 interface HookEvent {
   type: string;
   action: string;
@@ -72,7 +51,6 @@ interface HookEvent {
   };
 }
 
-/** Minimal Plugin API interface for hook registration */
 interface PluginApi {
   registerHook(
     event: string,
@@ -85,19 +63,6 @@ interface PluginApi {
 // Hook Registration
 // ---------------------------------------------------------------------------
 
-/**
- * Register log hooks for turn collection and session-end flushing.
- *
- * Registers two hooks:
- * 1. "message:preprocessed" — collects each user message turn
- * 2. "session:end" — flushes all turns to MemChain /log
- *
- * @param api      - OpenClaw Plugin API
- * @param client   - MemChain HTTP client
- * @param sessions - In-memory session state store
- * @param cfg      - Plugin configuration
- * @param log      - Plugin logger
- */
 export function registerLogHook(
   api: PluginApi,
   client: MemChainClient,
@@ -116,8 +81,6 @@ export function registerLogHook(
       const sessionKey = event.sessionKey;
       if (!sessionKey) return;
 
-      // Extract user message content.
-      // "body" is the processed text; "transcript" is for audio messages.
       const content = event.context?.body || event.context?.transcript;
       if (!content || typeof content !== "string") return;
 
@@ -152,7 +115,6 @@ export function registerLogHook(
       const sessionKey = event.sessionKey;
       if (!sessionKey) return;
 
-      // Retrieve collected turns
       const turns = sessions.getTurns(sessionKey);
       if (!turns.length) {
         log.debug("No turns to log", { sessionKey });
@@ -160,18 +122,14 @@ export function registerLogHook(
         return;
       }
 
-      // Retrieve recall_context for negative feedback correlation
       const recallCtx = sessions.getRecallContext(sessionKey);
       const sessionId = sessions.getSessionId(sessionKey);
 
       try {
-        // Build recall_context JSON for MemChain's negative feedback detection.
-        // Format matches what log_handler.rs expects:
-        // [{"id":"record_id","score":1.3,"features":[]}]
         let recallContextJson: string | undefined;
         if (recallCtx?.length) {
           recallContextJson = JSON.stringify(
-            recallCtx.map((m) => ({
+            recallCtx.map((m: Memory) => ({
               id: m.record_id,
               score: m.score,
               features: [],
@@ -208,8 +166,6 @@ export function registerLogHook(
           turnsLost: turns.length,
         });
       } finally {
-        // Always clear session state to prevent memory leaks,
-        // even if /log failed — the data is transient by design
         sessions.clear(sessionKey);
       }
     },
