@@ -1,0 +1,66 @@
+{
+  "id": "aeronyx-memchain",
+  "name": "AeroNyx MemChain",
+  "version": "0.1.0",
+  "description": "4-layer cognitive memory with MVF scoring, negative feedback learning, and co-occurrence graph for OpenClaw agents.",
+  "kind": "memory",
+  "entry": "./dist/index.js",
+  "author": "AeroNyx Team",
+  "license": "MIT",
+  "homepage": "https://github.com/AeroNyxNetwork/openclaw-memchain",
+  "openclaw": {
+    "minVersion": "2026.3.7",
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "hooks": [
+      "./hooks/memchain-lifecycle"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "memchainUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8421",
+        "description": "MemChain MPI endpoint URL"
+      },
+      "embeddingModel": {
+        "type": "string",
+        "default": "minilm-l6-v2",
+        "description": "Embedding model identifier (must match MemChain server)"
+      },
+      "sourceAi": {
+        "type": "string",
+        "default": "openclaw-memchain",
+        "description": "Source identifier for remember/log calls"
+      },
+      "tokenBudget": {
+        "type": "number",
+        "default": 2000,
+        "description": "Max tokens for recall context injection"
+      },
+      "recallTopK": {
+        "type": "number",
+        "default": 10,
+        "description": "Max memories to recall per turn"
+      },
+      "timeout": {
+        "type": "number",
+        "default": 5000,
+        "description": "HTTP timeout in ms"
+      },
+      "enableAutoRecall": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto-recall on every message"
+      },
+      "enableAutoLog": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto-log turns on session end"
+      }
+    }
+  }
+}
