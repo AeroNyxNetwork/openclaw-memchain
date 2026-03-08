@@ -5,19 +5,21 @@
  * Creation Reason: Core hook — intercepts every LLM prompt build,
  *   queries MemChain for relevant memories, injects into system prompt.
  *
- * Dependencies:
- *   - src/core/client.ts (MemChainClient)
- *   - src/core/session-store.ts (SessionStore)
- *   - src/core/formatter.ts (formatMemoriesForPrompt)
- *   - src/types/memchain.ts (MemChainPluginConfig)
+ * ⚠️ CRITICAL FIX (v0.1.2):
+ *   OpenClaw before_prompt_build actual parameter structure:
+ *     arg0 (event): { prompt: string, messages: Message[] }
+ *       - prompt = current user message text (with timestamp prefix)
+ *       - messages = full session history (role/content pairs)
+ *     arg1 (ctx): { agentId, sessionKey, sessionId, workspaceDir, messageProvider, trigger, channelId }
+ *       - sessionKey for MemChain session_id
+ *       - NO messages on ctx
  *
- * ⚠️ Important Note for Next Developer:
- *   - This hook MUST be fault-tolerant: any failure → return {} (no injection)
- *   - Never throw from the hook handler
- *   - Priority 100 ensures memories are injected before other plugins
- *   - After verification, change log.warn back to log.debug for production
+ *   Message content format:
+ *     { role: "user", content: [{ type: "text", text: "..." }], timestamp: number }
+ *     Content is an ARRAY of parts, not a plain string.
  *
- * Last Modified: v0.1.1 — warn-level logging at each step for deployment verification
+ * Last Modified: v0.1.2 — Fixed: messages on event (arg0), not ctx (arg1);
+ *   added prompt field extraction; handle content array format
  * ============================================
  */
 
@@ -33,18 +35,32 @@ interface PluginLogger {
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-interface PluginApi {
-  on(
-    event: string,
-    handler: (event: unknown, ctx: PromptBuildContext) => Promise<PromptBuildResult>,
-    options?: { priority?: number },
-  ): void;
-}
-/* eslint-enable @typescript-eslint/no-explicit-any */
 
+/**
+ * arg0: event object with prompt + messages
+ */
+interface PromptBuildEvent {
+  /** Current user message text (may have timestamp prefix like "[Sun 2026-03-08 18:51 UTC] hello") */
+  prompt: string;
+  /** Full session message history */
+  messages: Array<{
+    role: string;
+    content: string | Array<{ type: string; text?: string; thinking?: string }>;
+    timestamp?: number;
+  }>;
+}
+
+/**
+ * arg1: context object with session metadata
+ */
 interface PromptBuildContext {
+  agentId: string;
   sessionKey: string;
-  messages: Array<{ role: string; content: string | unknown }>;
+  sessionId: string;
+  workspaceDir: string;
+  messageProvider: string;
+  trigger: string;
+  channelId: string;
 }
 
 interface PromptBuildResult {
@@ -52,6 +68,16 @@ interface PromptBuildResult {
   appendSystemContext?: string;
   prependContext?: string;
 }
+
+interface PluginApi {
+  on(
+    event: string,
+    handler: (event: any, ctx: any) => Promise<PromptBuildResult>,
+    options?: { priority?: number },
+  ): void;
+}
+
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 // ---------------------------------------------------------------------------
 // Hook Registration
@@ -66,15 +92,15 @@ export function registerRecallHook(
 ): void {
   api.on(
     "before_prompt_build",
-    async (_event: unknown, ctx: PromptBuildContext): Promise<PromptBuildResult> => {
+    async (event: PromptBuildEvent, ctx: PromptBuildContext): Promise<PromptBuildResult> => {
       // Step 0: Guard
       if (!cfg.enableAutoRecall) {
-        log.warn("[MemChain] recall disabled by config");
         return {};
       }
 
-      // Step 1: Extract user message
-      const userMessage = extractLastUserMessage(ctx.messages);
+      // Step 1: Extract current user message
+      // Prefer event.prompt (direct, clean), fallback to last user message in event.messages
+      const userMessage = extractUserMessage(event);
       if (!userMessage) {
         log.warn("[MemChain] no user message found, skipping recall");
         return {};
@@ -87,15 +113,15 @@ export function registerRecallHook(
       });
 
       try {
-        // Step 2: Embed
+        // Step 2: Embed via MemChain local MiniLM
         const embedding = await client.embedSingle(userMessage);
         if (!embedding) {
-          log.warn("[MemChain] embed returned null — MemChain /embed unreachable");
+          log.warn("[MemChain] embed returned null — /embed unreachable");
           return {};
         }
         log.warn("[MemChain] embed OK", { dim: embedding.length });
 
-        // Step 3: Recall
+        // Step 3: Recall from MemChain
         const sessionId = sessions.getOrCreateSessionId(sessionKey);
         const result = await client.recall({
           embedding,
@@ -117,14 +143,14 @@ export function registerRecallHook(
           topMemory: result.memories[0]?.content?.slice(0, 60),
         });
 
-        // Step 4: Store recall context for /log
+        // Step 4: Store recall context for /log negative feedback correlation
         sessions.setRecallContext(sessionKey, result.memories);
 
-        // Step 5: Format and inject
+        // Step 5: Format and inject into system prompt
         const memoryContext = formatMemoriesForPrompt(result.memories);
-        log.warn("[MemChain] injecting into system prompt", {
+        log.warn("[MemChain] INJECTING into system prompt", {
           promptLength: memoryContext.length,
-          promptPreview: memoryContext.slice(0, 120),
+          preview: memoryContext.slice(0, 150),
         });
 
         return {
@@ -141,35 +167,84 @@ export function registerRecallHook(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Message extraction
 // ---------------------------------------------------------------------------
 
-function extractLastUserMessage(
-  messages: Array<{ role: string; content: string | unknown }>,
-): string | null {
-  if (!messages?.length) return null;
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "user") continue;
-
-    if (typeof msg.content === "string") {
-      const trimmed = msg.content.trim();
-      if (trimmed.length >= 3) return trimmed;
-      continue;
+/**
+ * Extract the current user message from the before_prompt_build event.
+ *
+ * Strategy:
+ * 1. Use event.prompt if available (current turn's user message)
+ *    - Strip timestamp prefix like "[Sun 2026-03-08 18:51 UTC] "
+ * 2. Fallback: walk event.messages backwards for last user role
+ *    - Content may be string or array of {type:"text", text:"..."}
+ */
+function extractUserMessage(event: PromptBuildEvent): string | null {
+  // Strategy 1: event.prompt (current user message with possible timestamp prefix)
+  if (event.prompt && typeof event.prompt === "string") {
+    const cleaned = stripTimestampPrefix(event.prompt.trim());
+    if (cleaned.length >= 3) {
+      return cleaned;
     }
+  }
 
-    if (Array.isArray(msg.content)) {
-      const textParts = (msg.content as Array<{ type: string; text?: string }>)
-        .filter((part) => part.type === "text" && part.text)
-        .map((part) => part.text!.trim())
-        .filter((text) => text.length >= 3);
-      if (textParts.length) return textParts.join(" ");
+  // Strategy 2: Walk messages backwards for last user message
+  if (Array.isArray(event.messages)) {
+    for (let i = event.messages.length - 1; i >= 0; i--) {
+      const msg = event.messages[i];
+      if (msg.role !== "user") continue;
+
+      const text = extractTextFromContent(msg.content);
+      if (text && text.length >= 3) {
+        return stripTimestampPrefix(text);
+      }
     }
   }
 
   return null;
 }
+
+/**
+ * Extract plain text from message content.
+ * Content can be:
+ *   - A plain string: "hello"
+ *   - An array of parts: [{ type: "text", text: "hello" }, { type: "image", ... }]
+ */
+function extractTextFromContent(
+  content: string | Array<{ type: string; text?: string; thinking?: string }>,
+): string | null {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    const textParts = content
+      .filter((part) => part.type === "text" && part.text)
+      .map((part) => part.text!.trim())
+      .filter((t) => t.length > 0);
+
+    if (textParts.length) {
+      return textParts.join(" ");
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Strip OpenClaw's timestamp prefix from user messages.
+ * Format: "[Sun 2026-03-08 18:51 UTC] actual message here"
+ * Also handles: "[Wed 2026-03-04 17:24 UTC] hello"
+ */
+function stripTimestampPrefix(text: string): string {
+  // Match: [Day YYYY-MM-DD HH:MM TZ]
+  const timestampPattern = /^\[[\w]{3}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+\w+\]\s*/;
+  return text.replace(timestampPattern, "").trim();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function summarizeLayers(memories: Array<{ layer: string }>): string {
   const counts: Record<string, number> = {};
