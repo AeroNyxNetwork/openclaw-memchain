@@ -1,78 +1,43 @@
 /**
  * ============================================
- * File: src/hooks/log-hook.ts
+ * File: src/hooks/health-hook.ts
  * ============================================
- * Creation Reason: Collect conversation turns during the session and flush
- *   them to MemChain's /log endpoint when the session ends. The /log rule
- *   engine auto-extracts identities, preferences, allergies (P0-P6 patterns)
- *   and detects negative feedback ("wrong", "搞错了") for memory correction.
+ * Creation Reason: Verify MemChain availability when OpenClaw gateway starts.
  *
  * Main Functionality:
- *   - Hook "message:preprocessed" → collect each user message as a turn
- *   - Hook "session:end" → batch-send all turns to MemChain /log
- *   - Include recall_context for negative feedback correlation
- *   - Graceful cleanup of session state after logging
+ *   - Hook into "session:start" event (fires on first session)
+ *   - Call GET /api/mpi/status to verify MemChain health
+ *   - Log status report
+ *   - Non-blocking: failure does not prevent OpenClaw from operating
  *
  * Dependencies:
- *   - src/core/client.ts (MemChainClient.log)
- *   - src/core/session-store.ts (SessionStore)
- *   - src/types/memchain.ts (MemChainPluginConfig)
- *   - OpenClaw Plugin SDK: api.registerHook()
- *
- * Main Logical Flow:
- *   1. message:preprocessed fires for each inbound message
- *   2. Extract user content (text or transcribed audio)
- *   3. Store as turn in SessionStore
- *   4. session:end fires when conversation terminates
- *   5. Retrieve all turns + recall_context from SessionStore
- *   6. POST /api/mpi/log with turns + recall_context
- *   7. Clear session state to free memory
+ *   - src/core/client.ts (MemChainClient)
  *
  * ⚠️ Important Note for Next Developer:
- *   - /log is the SAFETY NET — even if remember-tool isn't called,
- *     the rule engine extracts memories from raw conversation
- *   - recall_context is optional but HIGHLY recommended — without it,
- *     negative feedback detection can't identify which memory was wrong
- *   - session:end may not fire in all cases (e.g. gateway crash) —
- *     SessionStore's TTL cleanup handles orphaned sessions
- *   - Assistant messages are also collected to give the rule engine
- *     full conversation context for P3 (correction) detection
+ *   - Export function name MUST be registerHealthHook (not registerLogHook)
+ *   - This file does NOT import SessionStore — it only needs MemChainClient
+ *   - Runs ONCE per gateway lifecycle (uses hasChecked flag)
  *
- * Last Modified: v0.1.0 - Initial creation
+ * Last Modified: v0.1.0-fix1 — Fixed: correct export name, removed wrong imports
  * ============================================
  */
 
 import type { MemChainClient } from "../core/client.js";
-import type { SessionStore } from "../core/session-store.js";
-import type { MemChainPluginConfig } from "../types/memchain.js";
 
 /** Minimal logger interface */
 interface PluginLogger {
   info(msg: string, meta?: Record<string, unknown>): void;
   warn(msg: string, meta?: Record<string, unknown>): void;
-  debug(msg: string, meta?: Record<string, unknown>): void;
 }
 
-/**
- * OpenClaw hook event structure.
- * Fields vary by event type — we use the union of what we need.
- */
+/** Minimal hook event */
 interface HookEvent {
   type: string;
   action: string;
   sessionKey: string;
-  timestamp: Date;
-  messages: string[];
-  context: {
-    body?: string;
-    transcript?: string;
-    responseText?: string;
-    sessionEntry?: unknown;
-    senderId?: string;
-  };
 }
 
-/** Minimal Plugin API interface for hook registration */
+/** Minimal Plugin API */
 interface PluginApi {
   registerHook(
     event: string,
@@ -85,137 +50,67 @@ interface PluginApi {
 // Hook Registration
 // ---------------------------------------------------------------------------
 
-/**
- * Register log hooks for turn collection and session-end flushing.
- *
- * Registers two hooks:
- * 1. "message:preprocessed" — collects each user message turn
- * 2. "session:end" — flushes all turns to MemChain /log
- *
- * @param api      - OpenClaw Plugin API
- * @param client   - MemChain HTTP client
- * @param sessions - In-memory session state store
- * @param cfg      - Plugin configuration
- * @param log      - Plugin logger
- */
-export function registerLogHook(
+export function registerHealthHook(
   api: PluginApi,
   client: MemChainClient,
-  sessions: SessionStore,
-  cfg: MemChainPluginConfig,
   log: PluginLogger,
 ): void {
-  // -----------------------------------------------------------------------
-  // Hook 1: Collect user messages as conversation turns
-  // -----------------------------------------------------------------------
+  let hasChecked = false;
+
   api.registerHook(
-    "message:preprocessed",
-    async (event: HookEvent): Promise<void> => {
-      if (!cfg.enableAutoLog) return;
-
-      const sessionKey = event.sessionKey;
-      if (!sessionKey) return;
-
-      // Extract user message content.
-      // "body" is the processed text; "transcript" is for audio messages.
-      const content = event.context?.body || event.context?.transcript;
-      if (!content || typeof content !== "string") return;
-
-      const trimmed = content.trim();
-      if (!trimmed) return;
-
-      sessions.addTurn(sessionKey, {
-        role: "user",
-        content: trimmed,
-      });
-
-      log.debug("Turn collected", {
-        sessionKey,
-        role: "user",
-        length: trimmed.length,
-      });
-    },
-    {
-      name: "memchain.collect-user-turn",
-      description: "Collect user messages for MemChain /log rule engine",
-    },
-  );
-
-  // -----------------------------------------------------------------------
-  // Hook 2: Flush all turns to MemChain /log on session end
-  // -----------------------------------------------------------------------
-  api.registerHook(
-    "session:end",
-    async (event: HookEvent): Promise<void> => {
-      if (!cfg.enableAutoLog) return;
-
-      const sessionKey = event.sessionKey;
-      if (!sessionKey) return;
-
-      // Retrieve collected turns
-      const turns = sessions.getTurns(sessionKey);
-      if (!turns.length) {
-        log.debug("No turns to log", { sessionKey });
-        sessions.clear(sessionKey);
-        return;
-      }
-
-      // Retrieve recall_context for negative feedback correlation
-      const recallCtx = sessions.getRecallContext(sessionKey);
-      const sessionId = sessions.getSessionId(sessionKey);
+    "session:start",
+    async (_event: HookEvent): Promise<void> => {
+      if (hasChecked) return;
+      hasChecked = true;
 
       try {
-        // Build recall_context JSON for MemChain's negative feedback detection.
-        // Format matches what log_handler.rs expects:
-        // [{"id":"record_id","score":1.3,"features":[]}]
-        let recallContextJson: string | undefined;
-        if (recallCtx?.length) {
-          recallContextJson = JSON.stringify(
-            recallCtx.map((m) => ({
-              id: m.record_id,
-              score: m.score,
-              features: [],
-            })),
+        const status = await client.status();
+
+        if (!status) {
+          log.warn(
+            "🧠 MemChain: UNREACHABLE — memory features will be unavailable. " +
+            "Ensure AeroNyx server is running and MPI endpoint is accessible.",
+          );
+          return;
+        }
+
+        const checks = [
+          status.memchain_enabled ? "✅ Engine enabled" : "❌ Engine disabled",
+          status.index_ready ? "✅ Index ready" : "⚠️ Index rebuilding",
+          status.embed_ready ? `✅ Embed ready (${status.embed_dim}d)` : "⚠️ Embed not loaded",
+          `📊 Schema v${status.schema_version}`,
+          `📝 ${status.stats?.total_records ?? 0} memories stored`,
+        ];
+
+        if (status.mvf) {
+          checks.push(
+            status.mvf.enabled
+              ? `🧪 MVF active (α=${status.mvf.alpha})`
+              : `🧪 MVF standby (α=${status.mvf.alpha})`,
           );
         }
 
-        const result = await client.log({
-          session_id: sessionId || sessionKey,
-          turns,
-          source_ai: cfg.sourceAi,
-          recall_context: recallContextJson,
-        });
+        log.info(`🧠 MemChain: CONNECTED — ${checks.join(" | ")}`);
 
-        if (result) {
-          log.info("Session logged to MemChain", {
-            sessionKey,
-            sessionId,
-            turnsLogged: result.logged,
-            turnsCollected: turns.length,
-            hasRecallContext: !!recallContextJson,
-          });
-        } else {
-          log.warn("Failed to log session — MemChain unavailable", {
-            sessionKey,
-            turnsLost: turns.length,
-          });
+        if (!status.index_ready) {
+          log.warn(
+            "🧠 MemChain: Vector index not ready — recall results may be incomplete.",
+          );
+        }
+
+        if (!status.embed_ready) {
+          log.warn(
+            "🧠 MemChain: Local embedding engine not loaded — recall will fail.",
+          );
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        log.warn("Log hook failed", {
-          error: message,
-          sessionKey,
-          turnsLost: turns.length,
-        });
-      } finally {
-        // Always clear session state to prevent memory leaks,
-        // even if /log failed — the data is transient by design
-        sessions.clear(sessionKey);
+        log.warn(`🧠 MemChain: Health check error — ${message}`);
       }
     },
     {
-      name: "memchain.session-log",
-      description: "Flush conversation turns to MemChain /log on session end",
+      name: "memchain.health-check",
+      description: "Check MemChain availability on gateway startup",
     },
   );
 }
