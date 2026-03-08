@@ -1,110 +1,123 @@
 /**
  * ============================================
- * File: src/config.ts
+ * File: src/core/formatter.ts
  * ============================================
- * Creation Reason: Define the JSON Schema for plugin configuration.
- *   OpenClaw's Plugin SDK uses JSON Schema to render config forms in the
- *   Control UI and validate user-provided settings.
+ * Creation Reason: Transform MemChain recall results into a human-readable
+ *   text block suitable for injection into the LLM's system prompt.
  *
  * Main Functionality:
- *   - Exports configSchema() for OpenClawPluginDefinition.configSchema
- *   - Defines all user-configurable fields with defaults and descriptions
- *   - Defaults are tuned for local deployment (127.0.0.1:8421)
+ *   - Group memories by cognitive layer (identity → knowledge → episode)
+ *   - Format each memory with content, tags, and age indicator
+ *   - Add behavioral instructions for the LLM
  *
  * Dependencies:
- *   - Referenced by: src/index.ts (plugin entry)
- *   - Type mirror: src/types/memchain.ts → MemChainPluginConfig
- *
- * Main Logical Flow:
- *   1. OpenClaw reads this schema at plugin registration
- *   2. Control UI renders form fields based on properties
- *   3. User overrides are merged with defaults
- *   4. Final config is passed to register() via api.config()
+ *   - src/types/memchain.ts (Memory interface)
+ *   - Referenced by: hooks/recall-hook.ts
  *
  * ⚠️ Important Note for Next Developer:
- *   - Property names must match MemChainPluginConfig interface exactly
- *   - Defaults here must stay in sync with client.ts fallback values
- *   - Do NOT add non-serializable types (functions, classes)
+ *   - The output format directly affects LLM behavior — test changes carefully
+ *   - Identity memories MUST always appear first
+ *   - The "[MemChain]" prefix helps the LLM distinguish memory from other context
  *
- * Last Modified: v0.1.0 - Initial creation
+ * Last Modified: v0.1.0-fix1 — Fixed: added export keyword to function
  * ============================================
  */
 
-/**
- * Returns the JSON Schema for plugin configuration.
- * Called once during plugin registration.
- *
- * OpenClaw merges user-provided config with these defaults,
- * so every field must have a sensible default value.
- */
-export function configSchema() {
-  return {
-    type: "object" as const,
-    additionalProperties: false,
-    properties: {
-      memchainUrl: {
-        type: "string",
-        default: "http://127.0.0.1:8421",
-        description:
-          "MemChain MPI endpoint URL. Change this if MemChain runs on a different host or port.",
-      },
-      embeddingModel: {
-        type: "string",
-        default: "minilm-l6-v2",
-        description:
-          "Embedding model identifier. Must match the model configured in MemChain server. " +
-          "Changing this without re-embedding existing memories will break recall.",
-      },
-      sourceAi: {
-        type: "string",
-        default: "openclaw-memchain",
-        description:
-          "Source identifier sent with remember/log calls. " +
-          "Useful for distinguishing memories created by different AI frontends.",
-      },
-      tokenBudget: {
-        type: "number",
-        default: 2000,
-        minimum: 100,
-        maximum: 8000,
-        description:
-          "Maximum token budget for recall context injection into system prompt. " +
-          "Higher values give more context but consume more of the model's context window. " +
-          "2000 is recommended for most models.",
-      },
-      recallTopK: {
-        type: "number",
-        default: 10,
-        minimum: 1,
-        maximum: 50,
-        description:
-          "Maximum number of memories to recall per turn. " +
-          "Identity memories are always included regardless of this limit.",
-      },
-      timeout: {
-        type: "number",
-        default: 5000,
-        minimum: 1000,
-        maximum: 30000,
-        description:
-          "HTTP request timeout in milliseconds for all MemChain API calls. " +
-          "If MemChain does not respond within this time, the call is skipped gracefully.",
-      },
-      enableAutoRecall: {
-        type: "boolean",
-        default: true,
-        description:
-          "Automatically recall memories before every LLM prompt. " +
-          "Disable this if you want manual-only recall via the memchain_recall tool.",
-      },
-      enableAutoLog: {
-        type: "boolean",
-        default: true,
-        description:
-          "Automatically log conversation turns to MemChain on session end. " +
-          "The /log rule engine will auto-extract identities, preferences, and allergies. " +
-          "Disable this only if you handle logging externally.",
-      },
-    },
-  };
+import type { Memory } from "../types/memchain.js";
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export function formatMemoriesForPrompt(memories: Memory[]): string {
+  if (!memories.length) return "";
+
+  const identity: Memory[] = [];
+  const knowledge: Memory[] = [];
+  const episodes: Memory[] = [];
+
+  for (const m of memories) {
+    switch (m.layer) {
+      case "identity":
+        identity.push(m);
+        break;
+      case "knowledge":
+        knowledge.push(m);
+        break;
+      case "episode":
+      case "archive":
+        episodes.push(m);
+        break;
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push("[MemChain] What you know about this user:");
+
+  if (identity.length) {
+    lines.push("");
+    lines.push("Core identity:");
+    for (const m of identity) {
+      lines.push(formatMemoryLine(m, false));
+    }
+  }
+
+  if (knowledge.length) {
+    lines.push("");
+    lines.push("Preferences & knowledge:");
+    for (const m of knowledge) {
+      lines.push(formatMemoryLine(m, false));
+    }
+  }
+
+  if (episodes.length) {
+    lines.push("");
+    lines.push("Recent context:");
+    for (const m of episodes) {
+      lines.push(formatMemoryLine(m, true));
+    }
+  }
+
+  lines.push("");
+  lines.push("Use this context naturally. Do not repeat it back verbatim.");
+  lines.push("If any memory seems wrong, trust the user's current statement instead.");
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers (internal)
+// ---------------------------------------------------------------------------
+
+function formatMemoryLine(memory: Memory, showAge: boolean): string {
+  let line = `- ${memory.content}`;
+
+  if (memory.topic_tags?.length && memory.layer !== "identity") {
+    line += ` (${memory.topic_tags.join(", ")})`;
+  }
+
+  if (showAge && memory.timestamp) {
+    line += ` [${formatRelativeAge(memory.timestamp)}]`;
+  }
+
+  return line;
+}
+
+function formatRelativeAge(unixSeconds: number): string {
+  const nowSeconds = Date.now() / 1000;
+  const diffSeconds = Math.max(0, nowSeconds - unixSeconds);
+
+  if (diffSeconds < 60) {
+    return "just now";
+  }
+  if (diffSeconds < 3600) {
+    return `${Math.round(diffSeconds / 60)}m ago`;
+  }
+  if (diffSeconds < 86400) {
+    return `${Math.round(diffSeconds / 3600)}h ago`;
+  }
+  if (diffSeconds < 604800) {
+    return `${Math.round(diffSeconds / 86400)}d ago`;
+  }
+  return `${Math.round(diffSeconds / 604800)}w ago`;
 }
