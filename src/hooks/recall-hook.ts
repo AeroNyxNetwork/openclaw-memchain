@@ -5,13 +5,6 @@
  * Creation Reason: Core hook — intercepts every LLM prompt build,
  *   queries MemChain for relevant memories, injects into system prompt.
  *
- * Main Functionality:
- *   - Hook into OpenClaw's "before_prompt_build" lifecycle event
- *   - Extract latest user message from session
- *   - Call MemChain /api/mpi/embed → /api/mpi/recall
- *   - Format results and inject via prependSystemContext
- *   - Store recall_context in SessionStore for /log correlation
- *
  * Dependencies:
  *   - src/core/client.ts (MemChainClient)
  *   - src/core/session-store.ts (SessionStore)
@@ -22,8 +15,9 @@
  *   - This hook MUST be fault-tolerant: any failure → return {} (no injection)
  *   - Never throw from the hook handler
  *   - Priority 100 ensures memories are injected before other plugins
+ *   - After verification, change log.warn back to log.debug for production
  *
- * Last Modified: v0.1.0-fix1 — Fixed: correct import paths with export names
+ * Last Modified: v0.1.1 — warn-level logging at each step for deployment verification
  * ============================================
  */
 
@@ -32,13 +26,13 @@ import type { SessionStore } from "../core/session-store.js";
 import type { MemChainPluginConfig } from "../types/memchain.js";
 import { formatMemoriesForPrompt } from "../core/formatter.js";
 
-/** Minimal logger interface */
 interface PluginLogger {
   info(msg: string, meta?: Record<string, unknown>): void;
   warn(msg: string, meta?: Record<string, unknown>): void;
   debug(msg: string, meta?: Record<string, unknown>): void;
 }
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
 interface PluginApi {
   on(
     event: string,
@@ -46,6 +40,7 @@ interface PluginApi {
     options?: { priority?: number },
   ): void;
 }
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 interface PromptBuildContext {
   sessionKey: string;
@@ -72,25 +67,35 @@ export function registerRecallHook(
   api.on(
     "before_prompt_build",
     async (_event: unknown, ctx: PromptBuildContext): Promise<PromptBuildResult> => {
+      // Step 0: Guard
       if (!cfg.enableAutoRecall) {
+        log.warn("[MemChain] recall disabled by config");
         return {};
       }
 
+      // Step 1: Extract user message
       const userMessage = extractLastUserMessage(ctx.messages);
       if (!userMessage) {
-        log.debug("No user message found, skipping recall");
+        log.warn("[MemChain] no user message found, skipping recall");
         return {};
       }
 
       const sessionKey = ctx.sessionKey;
+      log.warn("[MemChain] recall started", {
+        sessionKey,
+        messagePreview: userMessage.slice(0, 80),
+      });
 
       try {
+        // Step 2: Embed
         const embedding = await client.embedSingle(userMessage);
         if (!embedding) {
-          log.debug("Embed unavailable, skipping recall");
+          log.warn("[MemChain] embed returned null — MemChain /embed unreachable");
           return {};
         }
+        log.warn("[MemChain] embed OK", { dim: embedding.length });
 
+        // Step 3: Recall
         const sessionId = sessions.getOrCreateSessionId(sessionKey);
         const result = await client.recall({
           embedding,
@@ -101,19 +106,25 @@ export function registerRecallHook(
         });
 
         if (!result?.memories?.length) {
-          log.debug("No memories recalled", { sessionKey });
+          log.warn("[MemChain] recall returned empty — no memories found");
           return {};
         }
 
-        sessions.setRecallContext(sessionKey, result.memories);
-
-        const memoryContext = formatMemoriesForPrompt(result.memories);
-
-        log.debug("Recall injected", {
-          sessionKey,
+        log.warn("[MemChain] recall OK", {
           memoryCount: result.memories.length,
           tokenEstimate: result.token_estimate,
           layers: summarizeLayers(result.memories),
+          topMemory: result.memories[0]?.content?.slice(0, 60),
+        });
+
+        // Step 4: Store recall context for /log
+        sessions.setRecallContext(sessionKey, result.memories);
+
+        // Step 5: Format and inject
+        const memoryContext = formatMemoriesForPrompt(result.memories);
+        log.warn("[MemChain] injecting into system prompt", {
+          promptLength: memoryContext.length,
+          promptPreview: memoryContext.slice(0, 120),
         });
 
         return {
@@ -121,10 +132,7 @@ export function registerRecallHook(
         };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        log.warn("Recall hook failed, continuing without memory", {
-          error: message,
-          sessionKey,
-        });
+        log.warn("[MemChain] recall hook error", { error: message, sessionKey });
         return {};
       }
     },
@@ -133,7 +141,7 @@ export function registerRecallHook(
 }
 
 // ---------------------------------------------------------------------------
-// Helper functions
+// Helpers
 // ---------------------------------------------------------------------------
 
 function extractLastUserMessage(
@@ -147,9 +155,7 @@ function extractLastUserMessage(
 
     if (typeof msg.content === "string") {
       const trimmed = msg.content.trim();
-      if (trimmed.length >= 3) {
-        return trimmed;
-      }
+      if (trimmed.length >= 3) return trimmed;
       continue;
     }
 
@@ -158,10 +164,7 @@ function extractLastUserMessage(
         .filter((part) => part.type === "text" && part.text)
         .map((part) => part.text!.trim())
         .filter((text) => text.length >= 3);
-
-      if (textParts.length) {
-        return textParts.join(" ");
-      }
+      if (textParts.length) return textParts.join(" ");
     }
   }
 
