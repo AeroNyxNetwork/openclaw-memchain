@@ -4,10 +4,10 @@
   "description": "AeroNyx MemChain 4-layer cognitive memory for OpenClaw agents. Provides automatic recall injection, conversation logging, and agent tools for remember/forget/recall via the MemChain MPI protocol.",
   "license": "MIT",
   "author": "AeroNyx Team",
-  "homepage": "https://github.com/AeroNyx/openclaw-memchain",
+  "homepage": "https://github.com/AeroNyxNetwork/openclaw-memchain",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AeroNyx/openclaw-memchain.git"
+    "url": "https://github.com/AeroNyxNetwork/openclaw-memchain.git"
   },
   "keywords": [
     "openclaw",
@@ -18,6 +18,7 @@
     "cognitive-memory",
     "long-term-memory"
   ],
+  "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -28,6 +29,9 @@
     "LICENSE"
   ],
   "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
     "hooks": [
       "./hooks/memchain-lifecycle"
     ]
