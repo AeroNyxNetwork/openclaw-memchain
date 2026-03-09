@@ -4,7 +4,7 @@
  * ============================================
  * Creation Reason: User-requested memory deletion from MemChain.
  *
- * Last Modified: v0.1.0-fix1 — Fixed: correct import from client.ts
+ * Last Modified: v0.1.3 — Fixed registerTool to match OpenClaw API (names plural)
  * ============================================
  */
 
@@ -15,27 +15,14 @@ interface PluginLogger {
   warn(msg: string, meta?: Record<string, unknown>): void;
 }
 
-interface ToolContext {
-  senderId?: string;
-}
-
+/* eslint-disable @typescript-eslint/no-explicit-any */
 interface PluginApi {
   registerTool(
-    factory: (ctx: ToolContext) => ToolDefinition,
-    options?: { name?: string; optional?: boolean },
+    factory: (ctx: any) => any | any[] | null,
+    options: { names: string[] },
   ): void;
 }
-
-interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  execute: (input: ForgetInput) => Promise<ToolResult>;
-}
-
-interface ToolResult {
-  result: string;
-}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 interface ForgetInput {
   record_id: string;
@@ -47,13 +34,12 @@ export function registerForgetTool(
   log: PluginLogger,
 ): void {
   api.registerTool(
-    (_ctx: ToolContext) => ({
+    (_ctx) => ({
       name: "memchain_forget",
       description:
         "Permanently delete a specific memory from MemChain. " +
         "First use memchain_recall to find the record_id, " +
         "show it to the user for confirmation, then call this tool.",
-
       inputSchema: {
         type: "object",
         properties: {
@@ -64,8 +50,7 @@ export function registerForgetTool(
         },
         required: ["record_id"],
       },
-
-      execute: async (input: ForgetInput): Promise<ToolResult> => {
+      execute: async (input: ForgetInput) => {
         const recordId = input.record_id?.trim();
         if (!recordId) {
           return { result: "No record_id provided. Use memchain_recall first." };
@@ -83,7 +68,7 @@ export function registerForgetTool(
           }
 
           if (result.status === "revoked") {
-            log.info("Memory forgotten", { recordId });
+            log.info("[MemChain] memory forgotten", { recordId });
             return { result: `Memory ${recordId.slice(0, 8)}... permanently deleted.` };
           }
 
@@ -94,11 +79,11 @@ export function registerForgetTool(
           return { result: `Unexpected response: ${result.status}.` };
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
-          log.warn("Forget tool failed", { error: message, recordId });
+          log.warn("[MemChain] forget tool failed", { error: message, recordId });
           return { result: "Failed to delete memory. Please try again." };
         }
       },
     }),
-    { name: "memchain", optional: true },
+    { names: ["memchain_forget"] },
   );
 }
