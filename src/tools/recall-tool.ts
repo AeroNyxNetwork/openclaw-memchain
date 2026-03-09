@@ -43,7 +43,7 @@ export function registerRecallTool(
       description:
         "Search MemChain for memories about the user. Use when the user asks " +
         '"what do you know about me?" or before calling memchain_forget.',
-      inputSchema: {
+      parameters: {
         type: "object",
         properties: {
           query: {
