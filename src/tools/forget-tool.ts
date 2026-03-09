@@ -40,7 +40,7 @@ export function registerForgetTool(
         "Permanently delete a specific memory from MemChain. " +
         "First use memchain_recall to find the record_id, " +
         "show it to the user for confirmation, then call this tool.",
-      inputSchema: {
+      parameters: {
         type: "object",
         properties: {
           record_id: {
