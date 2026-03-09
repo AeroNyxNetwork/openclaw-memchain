@@ -4,7 +4,7 @@
  * ============================================
  * Creation Reason: Agent explicitly searches MemChain for memories.
  *
- * Last Modified: v0.1.0-fix1 — Fixed: correct import from client.ts
+ * Last Modified: v0.1.3 — Fixed registerTool to match OpenClaw API (names plural)
  * ============================================
  */
 
@@ -17,27 +17,14 @@ interface PluginLogger {
   debug(msg: string, meta?: Record<string, unknown>): void;
 }
 
-interface ToolContext {
-  senderId?: string;
-}
-
+/* eslint-disable @typescript-eslint/no-explicit-any */
 interface PluginApi {
   registerTool(
-    factory: (ctx: ToolContext) => ToolDefinition,
-    options?: { name?: string; optional?: boolean },
+    factory: (ctx: any) => any | any[] | null,
+    options: { names: string[] },
   ): void;
 }
-
-interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  execute: (input: RecallInput) => Promise<ToolResult>;
-}
-
-interface ToolResult {
-  result: string;
-}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 interface RecallInput {
   query: string;
@@ -51,12 +38,11 @@ export function registerRecallTool(
   log: PluginLogger,
 ): void {
   api.registerTool(
-    (_ctx: ToolContext) => ({
+    (_ctx) => ({
       name: "memchain_recall",
       description:
         "Search MemChain for memories about the user. Use when the user asks " +
         '"what do you know about me?" or before calling memchain_forget.',
-
       inputSchema: {
         type: "object",
         properties: {
@@ -71,8 +57,7 @@ export function registerRecallTool(
         },
         required: ["query"],
       },
-
-      execute: async (input: RecallInput): Promise<ToolResult> => {
+      execute: async (input: RecallInput) => {
         const query = input.query?.trim();
         if (!query) {
           return { result: "No query provided." };
@@ -103,7 +88,7 @@ export function registerRecallTool(
 
           const formatted = formatRecallResults(result.memories, result.total_candidates);
 
-          log.debug("Manual recall", {
+          log.warn("[MemChain] manual recall executed", {
             query: query.slice(0, 50),
             returned: result.memories.length,
             candidates: result.total_candidates,
@@ -112,12 +97,12 @@ export function registerRecallTool(
           return { result: formatted };
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
-          log.warn("Recall tool failed", { error: message });
+          log.warn("[MemChain] recall tool failed", { error: message });
           return { result: "Memory search failed. Please try again." };
         }
       },
     }),
-    { name: "memchain", optional: true },
+    { names: ["memchain_recall"] },
   );
 }
 
