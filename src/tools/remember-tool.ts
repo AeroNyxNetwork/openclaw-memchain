@@ -55,7 +55,7 @@ export function registerRememberTool(
         "(language, style, tools), or important events (projects, deadlines). " +
         "Content should be a third-person summary, not the user's exact words. " +
         "Deduplication is automatic.",
-      inputSchema: {
+      parameters: {
         type: "object",
         properties: {
           content: {
