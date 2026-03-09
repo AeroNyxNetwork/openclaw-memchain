@@ -4,7 +4,16 @@
  * ============================================
  * Creation Reason: Agent proactively stores memories in MemChain.
  *
- * Last Modified: v0.1.0-fix1 — Fixed: correct import from client.ts
+ * ⚠️ CRITICAL FIX (v0.1.3):
+ *   OpenClaw registerTool actual API (from memory-core source):
+ *     api.registerTool(
+ *       (ctx) => toolDef | toolDef[] | null,
+ *       { names: ["tool_name"] }   ← names (plural), not name
+ *     )
+ *   ctx object has: ctx.config, ctx.sessionKey, etc.
+ *   Tool def: { name, description, inputSchema, execute }
+ *
+ * Last Modified: v0.1.3 — Fixed registerTool to match OpenClaw API
  * ============================================
  */
 
@@ -16,27 +25,14 @@ interface PluginLogger {
   warn(msg: string, meta?: Record<string, unknown>): void;
 }
 
-interface ToolContext {
-  senderId?: string;
-}
-
+/* eslint-disable @typescript-eslint/no-explicit-any */
 interface PluginApi {
   registerTool(
-    factory: (ctx: ToolContext) => ToolDefinition,
-    options?: { name?: string; optional?: boolean },
+    factory: (ctx: any) => any | any[] | null,
+    options: { names: string[] },
   ): void;
 }
-
-interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  execute: (input: RememberInput) => Promise<ToolResult>;
-}
-
-interface ToolResult {
-  result: string;
-}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 interface RememberInput {
   content: string;
@@ -51,7 +47,7 @@ export function registerRememberTool(
   log: PluginLogger,
 ): void {
   api.registerTool(
-    (_ctx: ToolContext) => ({
+    (_ctx) => ({
       name: "memchain_remember",
       description:
         "Store information about the user in long-term cognitive memory (MemChain). " +
@@ -59,7 +55,6 @@ export function registerRememberTool(
         "(language, style, tools), or important events (projects, deadlines). " +
         "Content should be a third-person summary, not the user's exact words. " +
         "Deduplication is automatic.",
-
       inputSchema: {
         type: "object",
         properties: {
@@ -73,10 +68,8 @@ export function registerRememberTool(
             type: "string",
             enum: ["identity", "knowledge", "episode"],
             description:
-              "Memory layer: " +
-              '"identity" for unchanging personal info, ' +
-              '"knowledge" for preferences and skills, ' +
-              '"episode" for events and tasks',
+              "Memory layer: identity (unchanging personal info), " +
+              "knowledge (preferences/skills), episode (events/tasks)",
           },
           topic_tags: {
             type: "array",
@@ -86,8 +79,7 @@ export function registerRememberTool(
         },
         required: ["content", "layer"],
       },
-
-      execute: async (input: RememberInput): Promise<ToolResult> => {
+      execute: async (input: RememberInput) => {
         const content = input.content?.trim();
         if (!content || content.length < 3) {
           return { result: "Content too short — provide a meaningful description." };
@@ -104,7 +96,7 @@ export function registerRememberTool(
           if (embedResult) {
             embedding = embedResult;
           } else {
-            log.warn("Embed unavailable for remember, storing without embedding");
+            log.warn("[MemChain] embed unavailable for remember, storing without embedding");
           }
 
           const result = await client.remember({
@@ -121,18 +113,19 @@ export function registerRememberTool(
           }
 
           if (result.status === "duplicate") {
-            return { result: `Already known (matches existing memory ${result.duplicate_of?.slice(0, 8)}...).` };
+            log.info("[MemChain] duplicate memory detected", { duplicateOf: result.duplicate_of });
+            return { result: `Already known (matches existing record).` };
           }
 
-          log.info("Memory stored", { recordId: result.record_id, layer: input.layer });
+          log.info("[MemChain] memory stored", { recordId: result.record_id, layer: input.layer });
           return { result: `Remembered [${input.layer}]: ${content}` };
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
-          log.warn("Remember tool failed", { error: message });
+          log.warn("[MemChain] remember tool failed", { error: message });
           return { result: "Failed to store memory. Will be captured via log." };
         }
       },
     }),
-    { name: "memchain", optional: true },
+    { names: ["memchain_remember"] },
   );
 }
