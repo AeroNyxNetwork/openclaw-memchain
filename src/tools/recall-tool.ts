@@ -57,7 +57,7 @@ export function registerRecallTool(
         },
         required: ["query"],
       },
-      execute: async (input: RecallInput) => {
+      execute: async (_toolCallId: string, input: RecallInput) => {
         const query = input.query?.trim();
         if (!query) {
           return { result: "No query provided." };
