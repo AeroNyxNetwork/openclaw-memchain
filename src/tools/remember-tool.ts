@@ -79,7 +79,7 @@ export function registerRememberTool(
         },
         required: ["content", "layer"],
       },
-      execute: async (input: RememberInput) => {
+      execute: async (_toolCallId: string, input: RememberInput) => {
         const content = input.content?.trim();
         if (!content || content.length < 3) {
           return { result: "Content too short — provide a meaningful description." };
