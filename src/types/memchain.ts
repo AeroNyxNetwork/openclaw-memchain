@@ -219,8 +219,14 @@ export interface StatusResponse {
 // ---------------------------------------------------------------------------
 
 export interface MemChainPluginConfig {
-  /** MemChain MPI endpoint URL (default: "http://127.0.0.1:8421") */
+  /** Operating mode: "local" (Bearer token + localhost) or "remote" (Ed25519 + E2E encryption) */
+  mode: "local" | "remote";
+  /** MemChain MPI endpoint URL for local mode (default: "http://127.0.0.1:8421") */
   memchainUrl: string;
+  /** Remote MemChain node URL. Only used in remote mode. */
+  nodeUrl: string;
+  /** Path to Ed25519 key pair file (default: "~/.openclaw/memchain-keys.json") */
+  keyStorePath: string;
   /** Embedding model identifier (default: "minilm-l6-v2") */
   embeddingModel: string;
   /** Source AI identifier for remember/log calls (default: "openclaw-memchain") */
