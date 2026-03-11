@@ -77,7 +77,9 @@ export function registerLogHook(
     "message:preprocessed",
     async (event: HookEvent): Promise<void> => {
       if (!cfg.enableAutoLog) return;
-
+      // Remote mode: /log is forbidden, but we still collect turns
+      // in case we add local rule engine in the future
+      
       const sessionKey = event.sessionKey;
       if (!sessionKey) return;
 
@@ -92,7 +94,7 @@ export function registerLogHook(
         content: trimmed,
       });
 
-      log.debug("Turn collected", {
+      log.debug("[MemChain] Turn collected", {
         sessionKey,
         role: "user",
         length: trimmed.length,
@@ -115,9 +117,16 @@ export function registerLogHook(
       const sessionKey = event.sessionKey;
       if (!sessionKey) return;
 
+      // Remote mode: /log is forbidden (403), skip entirely
+      if (cfg.mode === "remote") {
+        log.debug("[MemChain] /log skipped in remote mode — memory extraction via memchain_remember tool only");
+        sessions.clear(sessionKey);
+        return;
+      }
+
       const turns = sessions.getTurns(sessionKey);
       if (!turns.length) {
-        log.debug("No turns to log", { sessionKey });
+        log.debug("[MemChain] No turns to log", { sessionKey });
         sessions.clear(sessionKey);
         return;
       }
@@ -145,7 +154,7 @@ export function registerLogHook(
         });
 
         if (result) {
-          log.info("Session logged to MemChain", {
+          log.info("[MemChain] Session logged", {
             sessionKey,
             sessionId,
             turnsLogged: result.logged,
@@ -153,14 +162,14 @@ export function registerLogHook(
             hasRecallContext: !!recallContextJson,
           });
         } else {
-          log.warn("Failed to log session — MemChain unavailable", {
+          log.warn("[MemChain] Failed to log session — MemChain unavailable", {
             sessionKey,
             turnsLost: turns.length,
           });
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        log.warn("Log hook failed", {
+        log.warn("[MemChain] Log hook failed", {
           error: message,
           sessionKey,
           turnsLost: turns.length,
