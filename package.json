@@ -1,7 +1,7 @@
 {
   "name": "aeronyx-memchain",
-  "version": "0.1.1",
-  "description": "AeroNyx MemChain 4-layer cognitive memory for OpenClaw agents. Provides automatic recall injection, conversation logging, and agent tools for remember/forget/recall via the MemChain MPI protocol.",
+  "version": "0.2.0",
+  "description": "AeroNyx MemChain 4-layer cognitive memory for OpenClaw agents. Supports local and remote modes with Ed25519 authentication and end-to-end encryption.",
   "license": "MIT",
   "author": "AeroNyx Team",
   "homepage": "https://github.com/AeroNyxNetwork/openclaw-memchain",
@@ -16,7 +16,8 @@
     "aeronyx",
     "ai-memory",
     "cognitive-memory",
-    "long-term-memory"
+    "long-term-memory",
+    "e2e-encryption"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -44,6 +45,11 @@
     "lint": "eslint src/",
     "prepublishOnly": "npm run build",
     "clean": "rm -rf dist/"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^2.2.0",
+    "@noble/hashes": "^1.7.0",
+    "@noble/ciphers": "^1.2.0"
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.7"
