@@ -59,7 +59,6 @@ import type {
   LogRequest,
   LogResponse,
   StatusResponse,
-  Memory,
 } from "../types/memchain.js";
 
 // ---------------------------------------------------------------------------
