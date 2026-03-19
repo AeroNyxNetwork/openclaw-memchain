@@ -2,38 +2,26 @@
  * ============================================
  * File: src/core/client.ts
  * ============================================
- * Creation Reason: Centralized HTTP client for all MemChain MPI endpoints.
+ * v0.3.0 Changes:
+ *   - Added "cloud" mode: plugin → CMS → WS → node
+ *   - Cloud mode uses Bearer token (CMS auth) + Ed25519 signature (node auth)
+ *   - Cloud mode MPI path: /api/privacy_network/memchain/mpi/<endpoint>
+ *   - Cloud mode startup: register-pubkey → check bindings → auto-assign
+ *   - Cloud mode E2E encryption: same as remote (content encrypted, embedding not)
+ *   - /log disabled in both remote and cloud modes
  *
- * v0.2.0 Changes:
- *   - Added "remote" mode with Ed25519 signature authentication
- *   - Added end-to-end encryption (ChaCha20-Poly1305) for content fields
- *   - Added automatic Ed25519 key pair generation + file storage
- *   - Local mode behavior is 100% unchanged
- *   - /log returns null in remote mode (403 expected, not an error)
- *
- * Main Logical Flow (remote mode):
- *   1. On init: load or generate Ed25519 key pair from keyStorePath
- *   2. Derive record_key via HKDF-SHA256 for content encryption
- *   3. On request: sign with Ed25519, add X-MemChain-* headers
- *   4. On remember: encrypt content field before sending
- *   5. On recall: decrypt content fields after receiving
- *
- * Dependencies:
- *   - @noble/ed25519 (Ed25519 sign/verify)
- *   - @noble/hashes (SHA256, HMAC, HKDF)
- *   - @noble/ciphers (ChaCha20-Poly1305)
- *   - src/types/memchain.ts (all request/response types)
- *   - Node.js built-in: fs, path, os, crypto (for file I/O only)
+ * Three modes:
+ *   local:  Bearer token + localhost + plaintext
+ *   remote: Ed25519 sign + direct node + E2E encrypt
+ *   cloud:  Bearer + Ed25519 sign + CMS relay + E2E encrypt
  *
  * ⚠️ Important Note for Next Developer:
- *   - ALL methods still return T | null — null means unavailable
- *   - Remote mode /log returns null by design (403 is expected)
- *   - Embedding fields are NEVER encrypted (node needs them for vector search)
- *   - Deterministic nonce (HMAC-based) is required for dedup to work
- *   - Key file permissions must be 600 — do not change this
- *   - Timestamp tolerance is ±300 seconds (5 minutes)
+ *   - Cloud mode has TWO auth layers: Bearer (CMS) + Ed25519 (node, transparent)
+ *   - CMS MPI path prefix: /api/privacy_network/memchain/mpi/
+ *   - Cloud startup calls 3 CMS endpoints before first MPI request
+ *   - If CMS startup fails, all MPI calls return null (graceful degradation)
  *
- * Last Modified: v0.2.0 — Added remote mode (Ed25519 + E2E encryption)
+ * Last Modified: v0.3.0 — Added cloud mode (CMS relay + E2E encryption)
  * ============================================
  */
 
@@ -59,6 +47,10 @@ import type {
   LogRequest,
   LogResponse,
   StatusResponse,
+  SearchResponse,
+  ContextInjectResponse,
+  SessionDetailResponse,
+  ConversationResponse,
 } from "../types/memchain.js";
 
 // ---------------------------------------------------------------------------
@@ -66,21 +58,15 @@ import type {
 // ---------------------------------------------------------------------------
 
 export interface MemChainClientConfig {
-  /** "local" or "remote" */
-  mode: "local" | "remote";
-  /** Base URL: localhost for local, remote node URL for remote */
+  mode: "local" | "remote" | "cloud";
   baseUrl: string;
-  /** Remote node URL (only used in remote mode) */
   nodeUrl: string;
-  /** Path to Ed25519 key file */
+  cmsUrl: string;
+  apiKey: string;
   keyStorePath: string;
-  /** Default embedding model identifier */
   embeddingModel: string;
-  /** Default source_ai identifier */
   sourceAi: string;
-  /** HTTP request timeout in milliseconds */
   timeout: number;
-  /** Plugin logger */
   logger: PluginLogger;
 }
 
@@ -91,14 +77,21 @@ interface PluginLogger {
   error(msg: string, meta?: Record<string, unknown>): void;
 }
 
+interface KeyStore {
+  privateKey: string;
+  publicKey: string;
+  createdAt: string;
+}
+
 // ---------------------------------------------------------------------------
-// Key Store Types
+// CMS API response types
 // ---------------------------------------------------------------------------
 
-interface KeyStore {
-  privateKey: string; // 64-char hex (32 bytes)
-  publicKey: string;  // 64-char hex (32 bytes)
-  createdAt: string;  // ISO 8601
+interface CmsBindingResponse {
+  bindings: Array<{
+    node_id: string;
+    status: string;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,43 +101,133 @@ interface KeyStore {
 export class MemChainClient {
   private readonly cfg: MemChainClientConfig;
 
-  // Ed25519 keys (remote mode only, loaded lazily)
+  // Ed25519 keys (remote + cloud modes)
   private privateKey: Uint8Array | null = null;
   private publicKey: Uint8Array | null = null;
   private publicKeyHex: string = "";
 
-  // Derived record encryption key (remote mode only)
+  // Derived record encryption key
   private recordKey: Uint8Array | null = null;
 
   // Initialization state
   private initialized = false;
+  private cloudReady = false;
 
   constructor(cfg: MemChainClientConfig) {
     this.cfg = cfg;
   }
 
   // -------------------------------------------------------------------------
-  // Lazy initialization (loads keys on first use in remote mode)
+  // Lazy initialization
   // -------------------------------------------------------------------------
 
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return;
     this.initialized = true;
 
-    if (this.cfg.mode !== "remote") return;
+    if (this.cfg.mode === "local") return;
 
     try {
+      // Both remote and cloud need Ed25519 keys
       await this.loadOrGenerateKeys();
       this.deriveRecordKey();
-      this.cfg.logger.info("[MemChain] Remote mode initialized", {
+
+      // Cloud mode: register pubkey + check/assign binding
+      if (this.cfg.mode === "cloud") {
+        await this.cloudStartup();
+      }
+
+      this.cfg.logger.info("[MemChain] Initialized", {
+        mode: this.cfg.mode,
         publicKey: this.publicKeyHex.slice(0, 16) + "...",
-        keyStore: this.cfg.keyStorePath,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.cfg.logger.error("[MemChain] Failed to initialize remote mode keys", { error: msg });
-      // Mark as not initialized so it can retry
+      this.cfg.logger.error("[MemChain] Initialization failed", {
+        mode: this.cfg.mode,
+        error: msg,
+      });
       this.initialized = false;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Cloud mode startup: register pubkey → check bindings → auto-assign
+  // -------------------------------------------------------------------------
+
+  private async cloudStartup(): Promise<void> {
+    const cmsUrl = this.cfg.cmsUrl.replace(/\/+$/, "");
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${this.cfg.apiKey}`,
+    };
+
+    // Step 1: Register public key with CMS
+    try {
+      const regRes = await fetch(
+        `${cmsUrl}/api/privacy_network/memchain/register-pubkey/`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ public_key: this.publicKeyHex }),
+        },
+      );
+
+      if (!regRes.ok && regRes.status !== 409) {
+        // 409 = already registered, that's fine
+        this.cfg.logger.warn("[MemChain] Cloud: pubkey registration failed", {
+          status: regRes.status,
+        });
+      } else {
+        this.cfg.logger.info("[MemChain] Cloud: pubkey registered");
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.cfg.logger.warn("[MemChain] Cloud: pubkey registration error", { error: msg });
+    }
+
+    // Step 2: Check existing bindings
+    try {
+      const bindRes = await fetch(
+        `${cmsUrl}/api/privacy_network/memchain/bindings/`,
+        { method: "GET", headers },
+      );
+
+      if (bindRes.ok) {
+        const data = (await bindRes.json()) as CmsBindingResponse;
+        const active = data.bindings?.filter((b) => b.status === "active") ?? [];
+
+        if (active.length > 0) {
+          this.cloudReady = true;
+          this.cfg.logger.info("[MemChain] Cloud: binding found", {
+            nodeId: active[0].node_id,
+          });
+          return;
+        }
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.cfg.logger.warn("[MemChain] Cloud: binding check error", { error: msg });
+    }
+
+    // Step 3: No binding — auto-assign a node
+    try {
+      const assignRes = await fetch(
+        `${cmsUrl}/api/privacy_network/memchain/assign/`,
+        { method: "POST", headers },
+      );
+
+      if (assignRes.ok) {
+        this.cloudReady = true;
+        this.cfg.logger.info("[MemChain] Cloud: node auto-assigned");
+      } else {
+        this.cfg.logger.warn("[MemChain] Cloud: node assignment failed", {
+          status: assignRes.status,
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.cfg.logger.warn("[MemChain] Cloud: node assignment error", { error: msg });
     }
   }
 
@@ -171,8 +254,8 @@ export class MemChainClient {
       embedding_model: req.embedding_model || this.cfg.embeddingModel,
     });
 
-    // Decrypt content fields in remote mode
-    if (result?.memories && this.cfg.mode === "remote") {
+    // Decrypt content in remote and cloud modes
+    if (result?.memories && this.isEncryptedMode()) {
       for (const memory of result.memories) {
         memory.content = this.decryptContent(memory.content);
       }
@@ -188,9 +271,8 @@ export class MemChainClient {
       embedding_model: req.embedding_model || this.cfg.embeddingModel,
     };
 
-    // Encrypt content field in remote mode
-    // Note: embedding is NEVER encrypted (node needs it for vector search)
-    if (this.cfg.mode === "remote") {
+    // Encrypt content in remote and cloud modes
+    if (this.isEncryptedMode()) {
       body.content = this.encryptContent(body.content);
     }
 
@@ -203,9 +285,9 @@ export class MemChainClient {
   }
 
   async log(req: LogRequest): Promise<LogResponse | null> {
-    // Remote mode: /log is forbidden (403) — skip silently
-    if (this.cfg.mode === "remote") {
-      this.cfg.logger.debug("[MemChain] /log skipped in remote mode (forbidden by node)");
+    // Remote and cloud modes: /log is forbidden — skip silently
+    if (this.cfg.mode === "remote" || this.cfg.mode === "cloud") {
+      this.cfg.logger.debug("[MemChain] /log skipped in " + this.cfg.mode + " mode");
       return null;
     }
 
@@ -220,18 +302,79 @@ export class MemChainClient {
   }
 
   // -------------------------------------------------------------------------
-  // Ed25519 Key Management
+  // v2.5.0+ endpoints
   // -------------------------------------------------------------------------
 
   /**
-   * Load existing keys from keyStorePath, or generate new ones.
-   * File permissions are set to 600 (owner-only).
+   * BM25 full-text search with highlighted snippets.
+   * Results are grouped by session.
    */
+  async search(query: string, limit: number = 10): Promise<SearchResponse | null> {
+    return this.request<SearchResponse>(
+      "GET",
+      `/api/mpi/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+    );
+  }
+
+  /**
+   * Get pre-formatted context for system prompt injection.
+   * Returns project context, recent session summaries, and key entities.
+   * The formatted_context field is ready to inject directly.
+   */
+  async getContextInjection(maxTokens: number = 500): Promise<ContextInjectResponse | null> {
+    return this.request<ContextInjectResponse>(
+      "GET",
+      `/api/mpi/context/inject?max_tokens=${maxTokens}&recent_sessions=3`,
+    );
+  }
+
+  /**
+   * Get session details (title, summary, entities, artifacts).
+   */
+  async getSession(sessionId: string): Promise<SessionDetailResponse | null> {
+    return this.request<SessionDetailResponse>(
+      "GET",
+      `/api/mpi/sessions/${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  /**
+   * Replay a previous conversation (decrypted turns).
+   */
+  async getConversation(sessionId: string): Promise<ConversationResponse | null> {
+    const result = await this.request<ConversationResponse>(
+      "GET",
+      `/api/mpi/sessions/${encodeURIComponent(sessionId)}/conversation`,
+    );
+
+    // Decrypt turn content in remote/cloud modes
+    if (result?.turns && this.isEncryptedMode()) {
+      for (const turn of result.turns) {
+        if (turn.content && !turn.encrypted) {
+          turn.content = this.decryptContent(turn.content);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Helper: is this an encrypted mode?
+  // -------------------------------------------------------------------------
+
+  private isEncryptedMode(): boolean {
+    return this.cfg.mode === "remote" || this.cfg.mode === "cloud";
+  }
+
+  // -------------------------------------------------------------------------
+  // Ed25519 Key Management (shared by remote + cloud)
+  // -------------------------------------------------------------------------
+
   private async loadOrGenerateKeys(): Promise<void> {
     const keyPath = this.resolveKeyPath();
 
     if (existsSync(keyPath)) {
-      // Load existing keys
       const raw = readFileSync(keyPath, "utf-8");
       const store: KeyStore = JSON.parse(raw);
 
@@ -243,12 +386,8 @@ export class MemChainClient {
       this.publicKey = hexToBytes(store.publicKey);
       this.publicKeyHex = store.publicKey;
 
-      this.cfg.logger.info("[MemChain] Loaded Ed25519 keys from disk", {
-        path: keyPath,
-        publicKey: this.publicKeyHex.slice(0, 16) + "...",
-      });
+      this.cfg.logger.info("[MemChain] Loaded Ed25519 keys", { path: keyPath });
     } else {
-      // Generate new key pair
       this.privateKey = ed.utils.randomPrivateKey();
       this.publicKey = await ed.getPublicKeyAsync(this.privateKey);
       this.publicKeyHex = bytesToHex(this.publicKey);
@@ -260,24 +399,16 @@ export class MemChainClient {
       };
 
       writeFileSync(keyPath, JSON.stringify(store, null, 2) + "\n", "utf-8");
-
-      // Set permissions to 600 (owner read/write only)
       try {
         chmodSync(keyPath, 0o600);
       } catch {
         this.cfg.logger.warn("[MemChain] Could not set key file permissions to 600");
       }
 
-      this.cfg.logger.info("[MemChain] Generated new Ed25519 key pair", {
-        path: keyPath,
-        publicKey: this.publicKeyHex.slice(0, 16) + "...",
-      });
+      this.cfg.logger.info("[MemChain] Generated new Ed25519 key pair", { path: keyPath });
     }
   }
 
-  /**
-   * Resolve ~ in keyStorePath to actual home directory.
-   */
   private resolveKeyPath(): string {
     let p = this.cfg.keyStorePath;
     if (p.startsWith("~/")) {
@@ -287,22 +418,11 @@ export class MemChainClient {
   }
 
   // -------------------------------------------------------------------------
-  // Record Key Derivation (for content encryption)
+  // Record Key Derivation
   // -------------------------------------------------------------------------
 
-  /**
-   * Derive record encryption key from Ed25519 private key using HKDF-SHA256.
-   *
-   * record_key = HKDF-SHA256(
-   *   ikm: Ed25519 private key (32 bytes),
-   *   salt: "memchain-records" (UTF-8),
-   *   info: "v1" (UTF-8),
-   *   output: 32 bytes
-   * )
-   */
   private deriveRecordKey(): void {
     if (!this.privateKey) throw new Error("Private key not loaded");
-
     this.recordKey = hkdf(
       sha256,
       this.privateKey,
@@ -316,29 +436,14 @@ export class MemChainClient {
   // Content Encryption / Decryption (ChaCha20-Poly1305)
   // -------------------------------------------------------------------------
 
-  /**
-   * Encrypt plaintext content for remote storage.
-   *
-   * Uses deterministic nonce (HMAC-based) so identical content
-   * produces identical ciphertext — required for dedup to work.
-   *
-   * Format: hex(nonce(12 bytes) || ciphertext)
-   */
   private encryptContent(plaintext: string): string {
     if (!this.recordKey) return plaintext;
-
     try {
       const plaintextBytes = utf8ToBytes(plaintext);
-
-      // Deterministic nonce: HMAC-SHA256(record_key, plaintext)[0..12]
       const nonceHash = hmac(sha256, this.recordKey, plaintextBytes);
       const nonce = nonceHash.slice(0, 12);
-
-      // Encrypt with ChaCha20-Poly1305
       const cipher = chacha20poly1305(this.recordKey, nonce);
       const ciphertext = cipher.encrypt(plaintextBytes);
-
-      // Concatenate nonce + ciphertext and hex-encode
       return bytesToHex(concatBytes(nonce, ciphertext));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -347,55 +452,28 @@ export class MemChainClient {
     }
   }
 
-  /**
-   * Decrypt content received from remote node.
-   *
-   * Input: hex-encoded string of nonce(12) || ciphertext
-   * Output: UTF-8 plaintext
-   *
-   * Falls back to returning input as-is if decryption fails
-   * (handles case where content was stored in plaintext).
-   */
   private decryptContent(content: string): string {
     if (!this.recordKey) return content;
-
     try {
-      // Check if content looks like hex-encoded ciphertext
-      // Minimum: 12 bytes nonce + 16 bytes auth tag = 56 hex chars
       if (!/^[0-9a-f]{56,}$/i.test(content)) {
-        return content; // Not encrypted, return as-is
+        return content;
       }
-
       const data = hexToBytes(content);
-      if (data.length < 28) return content; // Too short for nonce + tag
-
+      if (data.length < 28) return content;
       const nonce = data.slice(0, 12);
       const ciphertext = data.slice(12);
-
       const cipher = chacha20poly1305(this.recordKey, nonce);
       const plaintext = cipher.decrypt(ciphertext);
-
       return new TextDecoder().decode(plaintext);
     } catch {
-      // Decryption failed — content might be plaintext or encrypted with different key
       return content;
     }
   }
 
   // -------------------------------------------------------------------------
-  // Request Signing (Ed25519)
+  // Request Signing (Ed25519) — used by remote + cloud
   // -------------------------------------------------------------------------
 
-  /**
-   * Generate Ed25519 signature headers for a request.
-   *
-   * Signature message: SHA256(timestamp + method + path + SHA256(body))
-   *
-   * Returns headers:
-   *   X-MemChain-PublicKey:  hex public key (64 chars)
-   *   X-MemChain-Timestamp: unix timestamp string
-   *   X-MemChain-Signature: hex signature (128 chars)
-   */
   private async signRequest(
     method: string,
     path: string,
@@ -406,8 +484,6 @@ export class MemChainClient {
     }
 
     const timestamp = Math.floor(Date.now() / 1000).toString();
-
-    // Construct signed message: SHA256(timestamp + method + path + SHA256(body))
     const bodyHash = sha256(bodyBytes);
     const message = sha256(
       concatBytes(
@@ -418,7 +494,6 @@ export class MemChainClient {
       ),
     );
 
-    // Sign the 32-byte message hash
     const signature = await ed.signAsync(message, this.privateKey);
 
     return {
@@ -429,7 +504,7 @@ export class MemChainClient {
   }
 
   // -------------------------------------------------------------------------
-  // HTTP Transport — mode-aware request dispatcher
+  // HTTP Transport — three-mode dispatcher
   // -------------------------------------------------------------------------
 
   private async request<T>(
@@ -437,36 +512,18 @@ export class MemChainClient {
     path: string,
     body?: unknown,
   ): Promise<T | null> {
-    // Ensure keys are loaded for remote mode
     await this.ensureInitialized();
 
-    const isRemote = this.cfg.mode === "remote";
-    const baseUrl = isRemote ? this.cfg.nodeUrl : this.cfg.baseUrl;
-    const url = `${baseUrl}${path}`;
+    // Build URL and headers based on mode
+    const { url, headers: modeHeaders } = await this.buildRequest(method, path, body);
 
     const bodyStr = body ? JSON.stringify(body) : undefined;
-    const bodyBytes = bodyStr ? utf8ToBytes(bodyStr) : new Uint8Array(0);
-
-    // Build headers
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { ...modeHeaders };
     if (bodyStr) {
       headers["Content-Type"] = "application/json";
     }
 
-    if (isRemote) {
-      // Remote mode: Ed25519 signature authentication
-      try {
-        const signHeaders = await this.signRequest(method, path, bodyBytes);
-        Object.assign(headers, signHeaders);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.cfg.logger.warn(`[MemChain] Failed to sign request ${path}`, { error: msg });
-        return null;
-      }
-    }
-    // Local mode: no auth headers needed (Bearer token handled by MemChain server config)
-
-    // Execute request with timeout
+    // Execute with timeout
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.cfg.timeout);
 
@@ -479,15 +536,15 @@ export class MemChainClient {
       });
 
       if (!res.ok) {
-        // Remote mode: 403 on /log is expected, not an error
-        if (isRemote && res.status === 403 && path === "/api/mpi/log") {
+        // Remote/cloud: 403 on /log is expected
+        if ((this.cfg.mode === "remote" || this.cfg.mode === "cloud") &&
+            res.status === 403 && path === "/api/mpi/log") {
           return null;
         }
 
-        this.cfg.logger.warn(`[MemChain] ${method} ${path} returned ${res.status}`, {
-          status: res.status,
-          statusText: res.statusText,
+        this.cfg.logger.warn(`[MemChain] ${method} ${path} → ${res.status}`, {
           mode: this.cfg.mode,
+          status: res.status,
         });
         return null;
       }
@@ -495,19 +552,73 @@ export class MemChainClient {
       return (await res.json()) as T;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-
       if (err instanceof DOMException && err.name === "AbortError") {
-        this.cfg.logger.warn(`[MemChain] ${method} ${path} timed out after ${this.cfg.timeout}ms`);
+        this.cfg.logger.warn(`[MemChain] ${method} ${path} timed out`);
       } else {
         this.cfg.logger.warn(`[MemChain] ${method} ${path} failed`, {
           error: message,
           mode: this.cfg.mode,
         });
       }
-
       return null;
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * Build URL and auth headers for the current mode.
+   *
+   * Local:  http://localhost:8421/api/mpi/<endpoint>
+   *         No auth headers (Bearer handled by server config)
+   *
+   * Remote: http://nodeIP:8421/api/mpi/<endpoint>
+   *         X-MemChain-PublicKey + Timestamp + Signature
+   *
+   * Cloud:  https://cms-url/api/privacy_network/memchain/mpi/<endpoint>
+   *         Authorization: Bearer sk-xxx  (CMS auth)
+   *         X-MemChain-PublicKey + Timestamp + Signature  (node auth, CMS transparent)
+   */
+  private async buildRequest(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<{ url: string; headers: Record<string, string> }> {
+    const bodyStr = body ? JSON.stringify(body) : undefined;
+    const bodyBytes = bodyStr ? utf8ToBytes(bodyStr) : new Uint8Array(0);
+
+    if (this.cfg.mode === "local") {
+      // Local: direct to localhost, no auth headers
+      return {
+        url: `${this.cfg.baseUrl}${path}`,
+        headers: {},
+      };
+    }
+
+    if (this.cfg.mode === "remote") {
+      // Remote: direct to node, Ed25519 sign
+      const signHeaders = await this.signRequest(method, path, bodyBytes);
+      return {
+        url: `${this.cfg.nodeUrl}${path}`,
+        headers: signHeaders,
+      };
+    }
+
+    // Cloud: CMS relay, Bearer + Ed25519 sign
+    // Path transformation: /api/mpi/remember → /api/privacy_network/memchain/mpi/remember
+    const endpoint = path.replace("/api/mpi/", "");
+    const cmsPath = `/api/privacy_network/memchain/mpi/${endpoint}`;
+    const cmsUrl = this.cfg.cmsUrl.replace(/\/+$/, "");
+
+    // Sign against the ORIGINAL MPI path (node verifies this, not the CMS path)
+    const signHeaders = await this.signRequest(method, path, bodyBytes);
+
+    return {
+      url: `${cmsUrl}${cmsPath}`,
+      headers: {
+        "Authorization": `Bearer ${this.cfg.apiKey}`,
+        ...signHeaders,
+      },
+    };
   }
 }
