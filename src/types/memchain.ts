@@ -215,16 +215,114 @@ export interface StatusResponse {
 }
 
 // ---------------------------------------------------------------------------
+// /api/mpi/search (v2.5.0+)
+// ---------------------------------------------------------------------------
+
+export interface SearchHit {
+  /** Source type: record, entity, or session */
+  source_type: "record" | "entity" | "session";
+  /** Source ID */
+  source_id: string;
+  /** Text snippet with <mark> tags for highlighting */
+  snippet: string;
+  /** BM25 relevance score */
+  score: number;
+  /** Associated session ID (if any) */
+  session_id: string | null;
+}
+
+export interface SessionSearchGroup {
+  session_id: string;
+  session_title: string | null;
+  project_name: string | null;
+  started_at: number | null;
+  hits: SearchHit[];
+  best_score: number;
+}
+
+export interface SearchResponse {
+  query: string;
+  results: SessionSearchGroup[];
+  total_results: number;
+}
+
+// ---------------------------------------------------------------------------
+// /api/mpi/context/inject (v2.5.0+)
+// ---------------------------------------------------------------------------
+
+export interface ContextInjectResponse {
+  /** Active project context (if any) */
+  project: { project_id: string; name: string; status: string } | null;
+  /** Recent session summaries */
+  recent_sessions: Array<{ session_id: string; title: string; summary: string }>;
+  /** Key entities with mention counts */
+  key_entities: Array<{ name: string; type: string; mentions: number }>;
+  /** Pre-formatted markdown context, ready to inject into system prompt */
+  formatted_context: string;
+  /** Estimated token count of formatted_context */
+  token_estimate: number;
+}
+
+// ---------------------------------------------------------------------------
+// /api/mpi/sessions/:id/conversation (v2.5.0+)
+// ---------------------------------------------------------------------------
+
+export interface ConversationTurn {
+  turn_index: number;
+  role: "user" | "assistant";
+  content: string | null;
+  encrypted: boolean;
+}
+
+export interface ConversationResponse {
+  session_id: string;
+  session: { title?: string; summary?: string; started_at?: number } | null;
+  turns: ConversationTurn[];
+  turn_count: number;
+}
+
+// ---------------------------------------------------------------------------
+// /api/mpi/sessions/:id (v2.5.0+)
+// ---------------------------------------------------------------------------
+
+export interface SessionDetailResponse {
+  session_id: string;
+  title: string | null;
+  summary: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+  turn_count: number;
+  entities: Array<{ name: string; type: string }>;
+  artifacts: Array<{ id: string; name: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// NER matched entities in recall (v2.5.0+)
+// ---------------------------------------------------------------------------
+
+export interface MatchedEntity {
+  text: string;
+  label: string;
+  confidence: number;
+  entity_id: string | null;
+  entity_type: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin Configuration (used in config.ts schema)
 // ---------------------------------------------------------------------------
 
 export interface MemChainPluginConfig {
-  /** Operating mode: "local" (Bearer token + localhost) or "remote" (Ed25519 + E2E encryption) */
-  mode: "local" | "remote";
+  /** Operating mode: "local", "remote", or "cloud" */
+  mode: "local" | "remote" | "cloud";
   /** MemChain MPI endpoint URL for local mode (default: "http://127.0.0.1:8421") */
   memchainUrl: string;
   /** Remote MemChain node URL. Only used in remote mode. */
   nodeUrl: string;
+  /** AeroNyx CMS API base URL. Only used in cloud mode. */
+  cmsUrl: string;
+  /** Bearer token for CMS authentication (sk-xxx). Only used in cloud mode. */
+  apiKey: string;
   /** Path to Ed25519 key pair file (default: "~/.openclaw/memchain-keys.json") */
   keyStorePath: string;
   /** Embedding model identifier (default: "minilm-l6-v2") */
