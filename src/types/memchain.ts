@@ -104,6 +104,10 @@ export interface RecallResponse {
   total_candidates: number;
   /** Estimated token count of all returned memories */
   token_estimate: number;
+  /** Query type used for this recall (v2.5.0+) */
+  query_type?: "semantic" | "keyword" | "hybrid";
+  /** NER-matched entities from the query (v2.5.0+) */
+  matched_entities?: MatchedEntity[];
 }
 
 // ---------------------------------------------------------------------------
