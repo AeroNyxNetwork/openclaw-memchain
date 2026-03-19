@@ -82,6 +82,29 @@ export function registerHealthHook(
           `📝 ${status.stats?.total_records ?? 0} memories stored`,
         ];
 
+        // v2.5.0+ fields (optional, may not exist on older Rust versions)
+        const statusAny = status as Record<string, unknown>;
+        if (typeof statusAny.ner_ready === "boolean") {
+          checks.push(statusAny.ner_ready ? "🔍 NER ready" : "⚠️ NER not loaded");
+        }
+        if (typeof statusAny.graph_enabled === "boolean") {
+          checks.push(statusAny.graph_enabled ? "🕸️ Graph enabled" : "📊 Graph disabled");
+        }
+
+        // Graph stats (v2.5.0+)
+        const graphStats = statusAny.graph_stats as Record<string, number> | undefined;
+        if (graphStats) {
+          checks.push(
+            `🔗 ${graphStats.entities ?? 0} entities, ${graphStats.communities ?? 0} communities`,
+          );
+        }
+
+        // SuperNode (v2.5.0+)
+        const supernode = statusAny.supernode as Record<string, unknown> | undefined;
+        if (supernode?.enabled) {
+          checks.push(`⚡ SuperNode active (${supernode.provider_count ?? 0} providers)`);
+        }
+
         if (status.mvf) {
           checks.push(
             status.mvf.enabled
