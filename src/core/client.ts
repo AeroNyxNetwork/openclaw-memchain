@@ -111,7 +111,6 @@ export class MemChainClient {
 
   // Initialization state
   private initialized = false;
-  private cloudReady = false;
 
   constructor(cfg: MemChainClientConfig) {
     this.cfg = cfg;
@@ -198,7 +197,6 @@ export class MemChainClient {
         const active = data.bindings?.filter((b) => b.status === "active") ?? [];
 
         if (active.length > 0) {
-          this.cloudReady = true;
           this.cfg.logger.info("[MemChain] Cloud: binding found", {
             nodeId: active[0].node_id,
           });
@@ -218,7 +216,6 @@ export class MemChainClient {
       );
 
       if (assignRes.ok) {
-        this.cloudReady = true;
         this.cfg.logger.info("[MemChain] Cloud: node auto-assigned");
       } else {
         this.cfg.logger.warn("[MemChain] Cloud: node assignment failed", {
