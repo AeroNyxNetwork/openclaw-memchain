@@ -2,14 +2,12 @@
  * ============================================
  * File: src/index.ts
  * ============================================
- * Creation Reason: Main entry point for aeronyx-memchain plugin.
+ * v0.3.0 Changes:
+ *   - Added cloud mode defaults (cmsUrl, apiKey)
+ *   - Startup validation: cloud requires cmsUrl + apiKey
+ *   - Pass new fields to MemChainClient
  *
- * v0.2.0 Changes:
- *   - Added mode/nodeUrl/keyStorePath to default config
- *   - Pass new fields to MemChainClient constructor
- *   - Log mode on initialization
- *
- * Last Modified: v0.2.0 — Remote mode support
+ * Last Modified: v0.3.0 — Cloud mode support
  * ============================================
  */
 
@@ -22,6 +20,8 @@ import { registerHealthHook } from "./hooks/health-hook.js";
 import { registerRememberTool } from "./tools/remember-tool.js";
 import { registerForgetTool } from "./tools/forget-tool.js";
 import { registerRecallTool } from "./tools/recall-tool.js";
+import { registerSearchTool } from "./tools/search-tool.js";
+import { registerReplayTool } from "./tools/replay-tool.js";
 import type { MemChainPluginConfig } from "./types/memchain.js";
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,8 @@ const DEFAULT_CONFIG: MemChainPluginConfig = {
   mode: "local",
   memchainUrl: "http://127.0.0.1:8421",
   nodeUrl: "",
+  cmsUrl: "https://api.aeronyx.network",
+  apiKey: "",
   keyStorePath: "~/.openclaw/memchain-keys.json",
   embeddingModel: "minilm-l6-v2",
   sourceAi: "openclaw-memchain",
@@ -43,7 +45,7 @@ const DEFAULT_CONFIG: MemChainPluginConfig = {
 };
 
 // ---------------------------------------------------------------------------
-// Plugin API type (actual shape from OpenClaw 2026.3.7)
+// Plugin API type
 // ---------------------------------------------------------------------------
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -57,7 +59,6 @@ interface PluginApi {
   pluginConfig: Record<string, any> | undefined;
   runtime: Record<string, any>;
   logger: PluginLogger;
-
   on(event: string, handler: (...args: any[]) => Promise<any>, options?: { priority?: number }): void;
   registerHook(event: string, handler: (...args: any[]) => Promise<void>, options?: { name?: string; description?: string }): void;
   registerTool(factory: (ctx: any) => any | any[] | null, options: { names: string[] }): void;
@@ -83,8 +84,8 @@ export default {
   name: "AeroNyx MemChain",
   description:
     "4-layer cognitive memory with MVF scoring, negative feedback learning, " +
-    "and co-occurrence graph. Supports local and remote modes with Ed25519 " +
-    "authentication and end-to-end encryption.",
+    "and co-occurrence graph. Supports local, remote, and cloud modes with " +
+    "Ed25519 authentication and end-to-end encryption.",
   kind: "memory",
   configSchema: configSchema(),
 
@@ -93,25 +94,41 @@ export default {
     const userConfig = (api.pluginConfig ?? {}) as Partial<MemChainPluginConfig>;
     const cfg: MemChainPluginConfig = { ...DEFAULT_CONFIG, ...userConfig };
 
-    // Validate remote mode config
+    // --- Mode validation ---
     if (cfg.mode === "remote" && !cfg.nodeUrl) {
-      log.error("[MemChain] Remote mode requires nodeUrl to be set. Falling back to local mode.");
+      log.error("[MemChain] Remote mode requires nodeUrl. Falling back to local.");
+      cfg.mode = "local";
+    }
+
+    if (cfg.mode === "cloud" && !cfg.apiKey) {
+      log.error("[MemChain] Cloud mode requires apiKey (sk-xxx). Falling back to local.");
+      cfg.mode = "local";
+    }
+
+    if (cfg.mode === "cloud" && !cfg.cmsUrl) {
+      log.error("[MemChain] Cloud mode requires cmsUrl. Falling back to local.");
       cfg.mode = "local";
     }
 
     log.info("[MemChain] Initializing plugin", {
       mode: cfg.mode,
-      url: cfg.mode === "local" ? cfg.memchainUrl : cfg.nodeUrl,
+      url: cfg.mode === "local"
+        ? cfg.memchainUrl
+        : cfg.mode === "remote"
+          ? cfg.nodeUrl
+          : cfg.cmsUrl,
       embeddingModel: cfg.embeddingModel,
       autoRecall: cfg.enableAutoRecall,
       autoLog: cfg.enableAutoLog,
     });
 
-    // Initialize MemChain HTTP client
+    // Initialize client
     const client = new MemChainClient({
       mode: cfg.mode,
       baseUrl: cfg.memchainUrl || "http://127.0.0.1:8421",
       nodeUrl: cfg.nodeUrl || "",
+      cmsUrl: cfg.cmsUrl || "https://api.aeronyx.network",
+      apiKey: cfg.apiKey || "",
       keyStorePath: cfg.keyStorePath || "~/.openclaw/memchain-keys.json",
       embeddingModel: cfg.embeddingModel || "minilm-l6-v2",
       sourceAi: cfg.sourceAi || "openclaw-memchain",
@@ -121,20 +138,22 @@ export default {
 
     const sessions = new SessionStore();
 
-    // Register lifecycle hooks
+    // Register hooks
     registerHealthHook(api, client, log);
     registerRecallHook(api, client, sessions, cfg, log);
     registerLogHook(api, client, sessions, cfg, log);
 
-    // Register agent tools
+    // Register tools
     registerRememberTool(api, client, cfg, log);
     registerForgetTool(api, client, log);
     registerRecallTool(api, client, cfg, log);
+    registerSearchTool(api, client, log);
+    registerReplayTool(api, client, log);
 
-    log.info("[MemChain] Plugin registered successfully", {
+    log.info("[MemChain] Plugin registered", {
       mode: cfg.mode,
       hooks: ["recall", "log", "health"],
-      tools: ["memchain_remember", "memchain_forget", "memchain_recall"],
+      tools: ["memchain_remember", "memchain_forget", "memchain_recall", "memchain_search", "memchain_replay"],
     });
   },
 };
