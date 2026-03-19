@@ -83,7 +83,7 @@ export function registerHealthHook(
         ];
 
         // v2.5.0+ fields (optional, may not exist on older Rust versions)
-        const statusAny = status as Record<string, unknown>;
+        const statusAny = status as unknown as Record<string, unknown>;
         if (typeof statusAny.ner_ready === "boolean") {
           checks.push(statusAny.ner_ready ? "🔍 NER ready" : "⚠️ NER not loaded");
         }
