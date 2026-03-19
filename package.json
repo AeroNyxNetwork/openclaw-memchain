@@ -1,7 +1,7 @@
 {
   "name": "aeronyx-memchain",
-  "version": "0.2.0",
-  "description": "AeroNyx MemChain 4-layer cognitive memory for OpenClaw agents. Supports local and remote modes with Ed25519 authentication and end-to-end encryption.",
+  "version": "0.3.0",
+  "description": "AeroNyx MemChain 4-layer cognitive memory for OpenClaw agents. Supports local, remote, and cloud modes with Ed25519 authentication, end-to-end encryption, keyword search, and conversation replay.",
   "license": "MIT",
   "author": "AeroNyx Team",
   "homepage": "https://github.com/AeroNyxNetwork/openclaw-memchain",
