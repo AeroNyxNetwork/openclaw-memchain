@@ -80,6 +80,42 @@ User: "I'm working on the MemChain integration this week"
   })
 ```
 
+## When to Use `memchain_search`
+
+Call this when the user asks to find something specific by keywords:
+
+- "Find where we discussed JWT"
+- "Search for Redis errors"
+- "When did I mention Alice?"
+
+The query should be keywords, not full sentences:
+```
+memchain_search({ query: "JWT authentication" })
+memchain_search({ query: "Redis connection timeout" })
+```
+
+Results are grouped by session with highlighted snippets.
+Use this instead of `memchain_recall` when the user knows exactly what
+term they're looking for (keyword match > semantic similarity).
+
+## When to Use `memchain_replay`
+
+Call this when the user wants to review a previous conversation:
+
+- "What did we discuss in our last session?"
+- "Show me the conversation about the API redesign"
+- "Replay session alpha_001"
+
+Workflow:
+1. Use `memchain_search` to find the relevant session_id
+2. Call `memchain_replay` with that session_id
+3. Present the key points from the conversation
+
+```
+memchain_replay({ session_id: "alpha_001" })
+memchain_replay({ session_id: "abc123", max_turns: 10 })
+```
+
 ## When to Use `memchain_recall`
 
 Call this when:
@@ -125,3 +161,16 @@ memchain_recall({ query: "programming preferences" })
 5. **Dedup is automatic**: If you're unsure whether something is already
    remembered, just call `memchain_remember` — MemChain will detect
    duplicates and skip them (Identity: cosine > 0.92, Knowledge: > 0.88).
+
+## Privacy Controls
+
+Users can use privacy tags in their messages to control what gets stored:
+
+- `<no-mem>sensitive info</no-mem>` — Content inside will NOT be stored in MemChain at all
+- `<private>private note</private>` — Content will be stored but excluded from recall results
+
+Example: "My API key is <no-mem>sk-abc123</no-mem>, please help me configure it."
+
+When you see these tags, respect them — do NOT include the tagged content in
+your `memchain_remember` calls. The /log rule engine handles tag stripping
+automatically, but if you're manually remembering, you must strip them yourself.
