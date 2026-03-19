@@ -113,15 +113,37 @@ export function registerRecallHook(
       });
 
       try {
-        // Step 2: Embed via MemChain local MiniLM
+        // Step 2: Get server-side formatted context (v2.5.0+, optional)
+        // This includes project context, recent session summaries, key entities
+        let serverContext = "";
+        try {
+          const inject = await client.getContextInjection(300);
+          if (inject?.formatted_context) {
+            serverContext = inject.formatted_context;
+            log.warn("[MemChain] context/inject OK", {
+              tokenEstimate: inject.token_estimate,
+              hasProject: !!inject.project,
+              sessions: inject.recent_sessions?.length ?? 0,
+              entities: inject.key_entities?.length ?? 0,
+            });
+          }
+        } catch {
+          // /context/inject not available (older Rust version) — continue without it
+        }
+
+        // Step 3: Embed via MemChain local MiniLM
         const embedding = await client.embedSingle(userMessage);
         if (!embedding) {
+          // Even without embed, we might have server context
+          if (serverContext) {
+            return { prependSystemContext: `## MemChain Context\n${serverContext}` };
+          }
           log.warn("[MemChain] embed returned null — /embed unreachable");
           return {};
         }
         log.warn("[MemChain] embed OK", { dim: embedding.length });
 
-        // Step 3: Recall from MemChain
+        // Step 4: Recall from MemChain
         const sessionId = sessions.getOrCreateSessionId(sessionKey);
         const result = await client.recall({
           embedding,
@@ -132,6 +154,10 @@ export function registerRecallHook(
         });
 
         if (!result?.memories?.length) {
+          // No memories but might have server context
+          if (serverContext) {
+            return { prependSystemContext: `## MemChain Context\n${serverContext}` };
+          }
           log.warn("[MemChain] recall returned empty — no memories found");
           return {};
         }
@@ -146,15 +172,23 @@ export function registerRecallHook(
         // Step 4: Store recall context for /log negative feedback correlation
         sessions.setRecallContext(sessionKey, result.memories);
 
-        // Step 5: Format and inject into system prompt
+        // Step 6: Format and inject into system prompt
         const memoryContext = formatMemoriesForPrompt(result.memories);
+
+        // Combine server context + memory context
+        const parts: string[] = [];
+        if (serverContext) parts.push(serverContext);
+        if (memoryContext) parts.push(memoryContext);
+        const combined = parts.join("\n\n");
+
         log.warn("[MemChain] INJECTING into system prompt", {
-          promptLength: memoryContext.length,
-          preview: memoryContext.slice(0, 150),
+          promptLength: combined.length,
+          hasServerContext: !!serverContext,
+          preview: combined.slice(0, 150),
         });
 
         return {
-          prependSystemContext: memoryContext,
+          prependSystemContext: combined,
         };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
