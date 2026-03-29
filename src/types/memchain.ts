@@ -7,8 +7,9 @@
  *   source of truth for the OpenClaw plugin side.
  *
  * Main Functionality:
- *   - Request/Response types for all 6 MPI endpoints
- *     (remember, recall, forget, log, status, embed)
+ *   - Request/Response types for all MPI endpoints
+ *     (remember, recall, forget, log, status, embed, search, context/inject,
+ *      sessions/:id, sessions/:id/conversation)
  *   - Memory layer enum and Memory record interface
  *   - Plugin configuration interface
  *
@@ -20,8 +21,12 @@
  *   - These types MUST stay in sync with MemChain Rust MPI definitions
  *   - Field names use snake_case to match the JSON wire format
  *   - Do NOT add runtime logic to this file — types only
+ *   - RecallRequest.query and RecallRequest.mode were added in v0.3.0
+ *     to support progressive retrieval (mode=index + /recall/detail)
+ *     per the v2.5.0 plugin integration guide P2 spec.
  *
- * Last Modified: v0.1.0 - Initial creation matching MemChain v2.1.0+MVF
+ * Last Modified: v0.3.0 — Added RecallRequest.query + mode (progressive
+ *                          retrieval support); all other types unchanged
  * ============================================
  */
 
@@ -95,6 +100,22 @@ export interface RecallRequest {
   token_budget?: number;
   /** Session ID for φ₇ session coherence scoring */
   session_id?: string;
+  /**
+   * Natural language query string used alongside the embedding.
+   * Optional — when provided, the server can use it for hybrid retrieval
+   * and progressive retrieval mode=index preview text generation.
+   * Added in v0.3.0 to support the P2 progressive retrieval spec.
+   */
+  query?: string;
+  /**
+   * Retrieval mode (v2.5.0+ progressive retrieval, P2 spec):
+   *   "full"  — returns complete memory content (default, current behavior)
+   *   "index" — returns lightweight previews only (~50 tokens each),
+   *             caller then fetches selected IDs via /recall/detail
+   * Omitting this field behaves identically to "full".
+   * Added in v0.3.0 for future progressive retrieval implementation.
+   */
+  mode?: "full" | "index";
 }
 
 export interface RecallResponse {
@@ -215,6 +236,21 @@ export interface StatusResponse {
     alpha: number;
     total_positive_feedback?: number;
     total_negative_feedback?: number;
+  };
+  /** NER status (v2.5.0+) */
+  ner_ready?: boolean;
+  /** Knowledge graph status (v2.5.0+) */
+  graph_enabled?: boolean;
+  /** SuperNode status (v2.5.0+) */
+  supernode?: {
+    enabled: boolean;
+    version?: string;
+  };
+  /** Graph statistics (v2.5.0+) */
+  graph_stats?: {
+    entities?: number;
+    knowledge_edges?: number;
+    communities?: number;
   };
 }
 
