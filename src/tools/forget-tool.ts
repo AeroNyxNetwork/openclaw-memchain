@@ -4,7 +4,27 @@
  * ============================================
  * Creation Reason: User-requested memory deletion from MemChain.
  *
- * Last Modified: v0.1.3 — Fixed registerTool to match OpenClaw API (names plural)
+ * Modification Reason (v0.3.0):
+ *   BUG FIX — execute() had wrong signature: (input) instead of (_toolCallId, input).
+ *   OpenClaw registerTool execute always receives two arguments:
+ *     arg0: toolCallId (string) — ignored here but must be declared
+ *     arg1: params      (object) — the actual tool input
+ *   With the single-argument signature, `input` was receiving the toolCallId
+ *   string instead of the params object, causing input.record_id to always
+ *   be undefined and every forget call to return "No record_id provided."
+ *   Both remember-tool.ts and recall-tool.ts already use the correct
+ *   two-argument form — this file was the only outlier.
+ *
+ * Dependencies:
+ *   - src/core/client.ts (MemChainClient)
+ *
+ * ⚠️ Important Note for Next Developer:
+ *   - execute() MUST always be (_toolCallId, params) — two args, no exceptions.
+ *     Forgetting the first arg silently breaks the tool with no TypeScript error
+ *     because the param type is compatible with string at runtime.
+ *   - Maintain interface compatibility with client.ts: client.forget(recordId)
+ *
+ * Last Modified: v0.3.0 — Fixed execute() signature (_toolCallId, input)
  * ============================================
  */
 
@@ -50,32 +70,30 @@ export function registerForgetTool(
         },
         required: ["record_id"],
       },
-      execute: async (input: ForgetInput) => {
+      // v0.3.0 FIX: was execute(input) — missing first arg caused input to receive
+      // the toolCallId string, making record_id always undefined.
+      execute: async (_toolCallId: string, input: ForgetInput) => {
         const recordId = input.record_id?.trim();
         if (!recordId) {
           return { result: "No record_id provided. Use memchain_recall first." };
         }
-
         if (recordId.length < 8) {
           return { result: `Invalid record_id "${recordId}".` };
         }
-
         try {
           const result = await client.forget(recordId);
-
           if (!result) {
             return { result: "Memory service temporarily unavailable." };
           }
-
           if (result.status === "revoked") {
             log.info("[MemChain] memory forgotten", { recordId });
             return { result: `Memory ${recordId.slice(0, 8)}... permanently deleted.` };
           }
-
           if (result.status === "not_found") {
-            return { result: `Memory ${recordId.slice(0, 8)}... not found. May already be deleted.` };
+            return {
+              result: `Memory ${recordId.slice(0, 8)}... not found. May already be deleted.`,
+            };
           }
-
           return { result: `Unexpected response: ${result.status}.` };
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
