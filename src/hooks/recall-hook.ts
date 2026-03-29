@@ -18,8 +18,51 @@
  *     { role: "user", content: [{ type: "text", text: "..." }], timestamp: number }
  *     Content is an ARRAY of parts, not a plain string.
  *
- * Last Modified: v0.1.2 — Fixed: messages on event (arg0), not ctx (arg1);
- *   added prompt field extraction; handle content array format
+ * Modification Reason (v0.3.0):
+ *   BUG FIX 1 — All normal operational logs (recall started, embed OK,
+ *   recall OK, INJECTING) were emitted at log.warn level. This polluted
+ *   the warning channel and made real errors hard to find. Fixed: use
+ *   log.debug for trace-level events, log.info for significant milestones,
+ *   reserve log.warn for genuine degraded-but-continuing situations.
+ *
+ *   BUG FIX 2 — client.recall() was called without the query field.
+ *   RecallRequest.query (added in v0.3.0) enables server-side hybrid
+ *   retrieval and progressive retrieval mode=index preview generation.
+ *   Now passes userMessage as query alongside the embedding.
+ *
+ *   BUG FIX 3 — Step numbering in comments had two "Step 4" entries
+ *   and jumped from 4 to 6. Renumbered sequentially (1–6).
+ *
+ *   BUG FIX 4 — getContextInjection() had an empty catch block.
+ *   Failures were completely invisible. Added log.debug so the reason
+ *   is surfaced without being noisy in normal operation.
+ *
+ * Dependencies:
+ *   - src/core/client.ts    (MemChainClient)
+ *   - src/core/session-store.ts (SessionStore)
+ *   - src/core/formatter.ts (formatMemoriesForPrompt)
+ *   - src/types/memchain.ts (MemChainPluginConfig)
+ *
+ * Main Logical Flow:
+ *   1. Extract current user message from event.prompt or event.messages
+ *   2. GET /context/inject — project context + session summaries (optional)
+ *   3. POST /embed — generate 384d query vector from user message
+ *   4. POST /recall — semantic search with embedding + query string
+ *   5. Store recall context in SessionStore (for /log negative feedback)
+ *   6. Combine server context + memory context → prependSystemContext
+ *
+ * ⚠️ Important Note for Next Developer:
+ *   - log.warn is ONLY for degraded-but-continuing situations (embed null,
+ *     recall empty while server context exists, hook error). NOT for tracing.
+ *   - Always pass query: userMessage to client.recall() — server needs it
+ *     for hybrid retrieval and future progressive retrieval support.
+ *   - getContextInjection failures must be logged (even at debug) so
+ *     version mismatches are discoverable without full debug logging.
+ *   - Maintain interface compatibility with session-store.ts:
+ *     getOrCreateSessionId / setRecallContext / getOrCreateSessionId
+ *
+ * Last Modified: v0.3.0 — Fixed log levels, added query to recall(),
+ *                          fixed step numbering, fixed silent catch block
  * ============================================
  */
 
@@ -107,43 +150,53 @@ export function registerRecallHook(
       }
 
       const sessionKey = ctx.sessionKey;
-      log.warn("[MemChain] recall started", {
+      // v0.3.0 FIX: was log.warn — this is a normal trace event, not a warning
+      log.debug("[MemChain] recall started", {
         sessionKey,
         messagePreview: userMessage.slice(0, 80),
       });
 
       try {
         // Step 2: Get server-side formatted context (v2.5.0+, optional)
-        // This includes project context, recent session summaries, key entities
+        // Returns project context, recent session summaries, key entities.
+        // Failure here is non-blocking — older Rust versions don't have this endpoint.
         let serverContext = "";
         try {
           const inject = await client.getContextInjection(300);
           if (inject?.formatted_context) {
             serverContext = inject.formatted_context;
-            log.warn("[MemChain] context/inject OK", {
+            // v0.3.0 FIX: was log.warn — significant milestone but not a warning
+            log.info("[MemChain] context/inject OK", {
               tokenEstimate: inject.token_estimate,
               hasProject: !!inject.project,
               sessions: inject.recent_sessions?.length ?? 0,
               entities: inject.key_entities?.length ?? 0,
             });
           }
-        } catch {
-          // /context/inject not available (older Rust version) — continue without it
+        } catch (injectErr: unknown) {
+          // v0.3.0 FIX: was empty catch — completely silent, impossible to debug.
+          // Use debug so version mismatches are discoverable without noisy logs.
+          const msg = injectErr instanceof Error ? injectErr.message : String(injectErr);
+          log.debug("[MemChain] context/inject unavailable (older server?)", { error: msg });
         }
 
         // Step 3: Embed via MemChain local MiniLM
         const embedding = await client.embedSingle(userMessage);
         if (!embedding) {
-          // Even without embed, we might have server context
+          // Even without embed, we might have server context worth injecting
           if (serverContext) {
+            log.warn("[MemChain] embed returned null — injecting server context only");
             return { prependSystemContext: `## MemChain Context\n${serverContext}` };
           }
-          log.warn("[MemChain] embed returned null — /embed unreachable");
+          log.warn("[MemChain] embed returned null — /embed unreachable, skipping recall");
           return {};
         }
-        log.warn("[MemChain] embed OK", { dim: embedding.length });
+        // v0.3.0 FIX: was log.warn — normal trace, not a warning
+        log.debug("[MemChain] embed OK", { dim: embedding.length });
 
         // Step 4: Recall from MemChain
+        // v0.3.0 FIX: Added query field — server needs it for hybrid retrieval
+        // and progressive retrieval mode=index preview generation.
         const sessionId = sessions.getOrCreateSessionId(sessionKey);
         const result = await client.recall({
           embedding,
@@ -151,25 +204,28 @@ export function registerRecallHook(
           top_k: cfg.recallTopK,
           token_budget: cfg.tokenBudget,
           session_id: sessionId,
+          query: userMessage,  // v0.3.0 FIX: was missing
         });
 
         if (!result?.memories?.length) {
-          // No memories but might have server context
+          // No memories — server context alone is still useful
           if (serverContext) {
+            log.warn("[MemChain] recall returned empty — injecting server context only");
             return { prependSystemContext: `## MemChain Context\n${serverContext}` };
           }
           log.warn("[MemChain] recall returned empty — no memories found");
           return {};
         }
 
-        log.warn("[MemChain] recall OK", {
+        // v0.3.0 FIX: was log.warn — significant milestone, use info
+        log.info("[MemChain] recall OK", {
           memoryCount: result.memories.length,
           tokenEstimate: result.token_estimate,
           layers: summarizeLayers(result.memories),
           topMemory: result.memories[0]?.content?.slice(0, 60),
         });
 
-        // Step 4: Store recall context for /log negative feedback correlation
+        // Step 5: Store recall context for /log negative feedback correlation
         sessions.setRecallContext(sessionKey, result.memories);
 
         // Step 6: Format and inject into system prompt
@@ -181,7 +237,8 @@ export function registerRecallHook(
         if (memoryContext) parts.push(memoryContext);
         const combined = parts.join("\n\n");
 
-        log.warn("[MemChain] INJECTING into system prompt", {
+        // v0.3.0 FIX: was log.warn — use info for injection confirmation
+        log.info("[MemChain] INJECTING into system prompt", {
           promptLength: combined.length,
           hasServerContext: !!serverContext,
           preview: combined.slice(0, 150),
@@ -192,6 +249,7 @@ export function registerRecallHook(
         };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
+        // Genuine unexpected error — warn is correct here
         log.warn("[MemChain] recall hook error", { error: message, sessionKey });
         return {};
       }
