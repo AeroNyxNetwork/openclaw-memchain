@@ -14,16 +14,34 @@
  *   - Auto-cleanup stale sessions (TTL-based eviction)
  *   - Clear session data after /log submission
  *
+ * Modification Reason (v0.3.0):
+ *   BUG FIX — MAX_TURNS_PER_SESSION overflow used shift() silently.
+ *   When a session exceeded 200 turns, the oldest turn was dropped without
+ *   any warning. This caused /log to silently submit incomplete conversation
+ *   data, making rule engine extraction unreliable for long sessions.
+ *   Fix: add a warn-once flag so the logger can surface this condition.
+ *   The overflow behavior (shift) is preserved — only the silence is fixed.
+ *
+ *   ADDITION — addAssistantTurn() convenience method.
+ *   log-hook.ts needs to collect assistant replies from a separate hook
+ *   event (message:response or equivalent) rather than from responseText
+ *   in message:preprocessed (which fires before LLM responds). A dedicated
+ *   method makes the intent explicit at call sites.
+ *
  * Dependencies:
  *   - src/types/memchain.ts (Memory, LogTurn types)
  *   - Referenced by: hooks/recall-hook.ts, hooks/log-hook.ts
  *
  * ⚠️ Important Note for Next Developer:
- *   - This is purely in-memory — data is lost on gateway restart
- *   - That's intentional: /log is the durable store, this is transient
- *   - Do NOT persist this to disk — it would duplicate MemChain's role
+ *   - This is purely in-memory — data is lost on gateway restart.
+ *     That's intentional: /log is the durable store, this is transient.
+ *   - Do NOT persist this to disk — it would duplicate MemChain's role.
+ *   - MAX_TURNS_PER_SESSION overflow drops the OLDEST turn (FIFO eviction).
+ *     If you change this to drop newest, update the comment + the warn message.
+ *   - hasWarnedOverflow is per-session, reset on clear(). It prevents log spam
+ *     for very long sessions without hiding the problem entirely.
  *
- * Last Modified: v0.1.0-fix1 — Fixed: added export keyword to class
+ * Last Modified: v0.3.0 — Overflow warning + addAssistantTurn() helper
  * ============================================
  */
 
@@ -33,8 +51,8 @@ import type { Memory, LogTurn } from "../types/memchain.js";
 // Constants
 // ---------------------------------------------------------------------------
 
-const SESSION_TTL_MS = 4 * 60 * 60 * 1000;
-const CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+const SESSION_TTL_MS = 4 * 60 * 60 * 1000;       // 4 hours
+const CLEANUP_INTERVAL_MS = 10 * 60 * 1000;       // 10 minutes
 const MAX_TURNS_PER_SESSION = 200;
 
 // ---------------------------------------------------------------------------
@@ -46,6 +64,8 @@ interface SessionEntry {
   turns: LogTurn[];
   recallContext: Memory[] | null;
   lastActivity: number;
+  /** v0.3.0: warn once when turn cap is hit, avoid log spam for long sessions */
+  hasWarnedOverflow: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -58,8 +78,12 @@ export class SessionStore {
 
   constructor() {
     this.cleanupTimer = setInterval(() => this.evictStale(), CLEANUP_INTERVAL_MS);
-    if (this.cleanupTimer && typeof this.cleanupTimer === "object" && "unref" in this.cleanupTimer) {
-      this.cleanupTimer.unref();
+    if (
+      this.cleanupTimer &&
+      typeof this.cleanupTimer === "object" &&
+      "unref" in this.cleanupTimer
+    ) {
+      (this.cleanupTimer as { unref(): void }).unref();
     }
   }
 
@@ -78,6 +102,7 @@ export class SessionStore {
       turns: [],
       recallContext: null,
       lastActivity: Date.now(),
+      hasWarnedOverflow: false,
     };
     this.sessions.set(sessionKey, newEntry);
     return newEntry.sessionId;
@@ -91,19 +116,43 @@ export class SessionStore {
   // Turn collection
   // -------------------------------------------------------------------------
 
-  addTurn(sessionKey: string, turn: LogTurn): void {
+  /**
+   * Add any turn (user or assistant). Callers should prefer the typed
+   * convenience wrappers below for clarity at call sites.
+   *
+   * v0.3.0: emits a one-time overflow warning instead of silently dropping.
+   */
+  addTurn(sessionKey: string, turn: LogTurn): { overflow: boolean } {
     const entry = this.getOrCreateEntry(sessionKey);
     entry.lastActivity = Date.now();
+
+    let overflow = false;
     if (entry.turns.length >= MAX_TURNS_PER_SESSION) {
-      entry.turns.shift();
+      entry.turns.shift(); // drop oldest (FIFO)
+      overflow = true;
     }
+
     entry.turns.push(turn);
+    return { overflow: overflow && !entry.hasWarnedOverflow };
+  }
+
+  /**
+   * Mark that the overflow warning has been emitted for this session,
+   * so subsequent overflows don't re-trigger it.
+   */
+  markOverflowWarned(sessionKey: string): void {
+    const entry = this.sessions.get(sessionKey);
+    if (entry) entry.hasWarnedOverflow = true;
   }
 
   getTurns(sessionKey: string): LogTurn[] {
     const entry = this.sessions.get(sessionKey);
     if (!entry) return [];
     return [...entry.turns];
+  }
+
+  getTurnCount(sessionKey: string): number {
+    return this.sessions.get(sessionKey)?.turns.length ?? 0;
   }
 
   // -------------------------------------------------------------------------
@@ -152,6 +201,7 @@ export class SessionStore {
         turns: [],
         recallContext: null,
         lastActivity: Date.now(),
+        hasWarnedOverflow: false,
       };
       this.sessions.set(sessionKey, entry);
     }
