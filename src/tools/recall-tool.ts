@@ -4,7 +4,28 @@
  * ============================================
  * Creation Reason: Agent explicitly searches MemChain for memories.
  *
- * Last Modified: v0.1.3 — Fixed registerTool to match OpenClaw API (names plural)
+ * Modification Reason (v0.3.0):
+ *   BUG FIX 1 — client.recall() was called without the query field.
+ *   RecallRequest.query (added in v0.3.0) enables server-side hybrid
+ *   retrieval and progressive retrieval mode=index preview generation.
+ *   Same fix applied to recall-hook.ts in the same release.
+ *
+ *   BUG FIX 2 — Successful manual recall was logged at log.warn level.
+ *   A user explicitly calling memchain_recall is a normal, expected event,
+ *   not a warning condition. Changed to log.info.
+ *
+ * Dependencies:
+ *   - src/core/client.ts (MemChainClient)
+ *   - src/types/memchain.ts (MemChainPluginConfig, Memory)
+ *
+ * ⚠️ Important Note for Next Developer:
+ *   - Always pass query to client.recall() — omitting it degrades server-side
+ *     hybrid retrieval quality even when an embedding is provided.
+ *   - log.warn is for degraded/error paths only. Successful tool execution
+ *     should use log.info.
+ *   - Maintain interface compatibility with client.ts: client.recall(RecallRequest)
+ *
+ * Last Modified: v0.3.0 — Added query to recall(), fixed log level warn→info
  * ============================================
  */
 
@@ -62,38 +83,33 @@ export function registerRecallTool(
         if (!query) {
           return { result: "No query provided." };
         }
-
         const topK = Math.min(Math.max(input.top_k || cfg.recallTopK, 1), 50);
-
         try {
           const embedding = await client.embedSingle(query);
           if (!embedding) {
             return { result: "Memory search unavailable — embedding service not responding." };
           }
-
           const result = await client.recall({
             embedding,
             embedding_model: cfg.embeddingModel,
             top_k: topK,
             token_budget: cfg.tokenBudget,
+            // v0.3.0 FIX: was missing — server needs query for hybrid retrieval
+            query,
           });
-
           if (!result) {
             return { result: "Memory search unavailable — MemChain not responding." };
           }
-
           if (!result.memories.length) {
             return { result: "No memories found matching that query." };
           }
-
           const formatted = formatRecallResults(result.memories, result.total_candidates);
-
-          log.warn("[MemChain] manual recall executed", {
+          // v0.3.0 FIX: was log.warn — manual recall is a normal event, not a warning
+          log.info("[MemChain] manual recall executed", {
             query: query.slice(0, 50),
             returned: result.memories.length,
             candidates: result.total_candidates,
           });
-
           return { result: formatted };
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
@@ -110,17 +126,14 @@ function formatRecallResults(memories: Memory[], totalCandidates: number): strin
   const lines: string[] = [];
   lines.push(`Found ${memories.length} memories (from ${totalCandidates} candidates):`);
   lines.push("");
-
   for (let i = 0; i < memories.length; i++) {
     const m = memories[i];
     const tags = m.topic_tags?.length ? m.topic_tags.join(", ") : "none";
     const shortId = m.record_id.slice(0, 8);
     const score = m.score.toFixed(2);
-
     lines.push(`${i + 1}. [${m.layer}] ${m.content}`);
     lines.push(`   ID: ${shortId}  Score: ${score}  Tags: ${tags}`);
     lines.push("");
   }
-
   return lines.join("\n");
 }
