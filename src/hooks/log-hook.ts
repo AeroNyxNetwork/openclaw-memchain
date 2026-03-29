@@ -6,8 +6,8 @@
  *   to MemChain /log on session end. Rule engine auto-extracts identities,
  *   preferences, allergies, and detects negative feedback.
  *
- * Modification Reason (v0.3.3):
- *   BUG FIX — All three hook event names were wrong, causing hooks to be
+ * Modification Reason (v0.3.2):
+ *   BUG FIX 1 — All three hook event names were wrong, causing hooks to be
  *   silently ignored by OpenClaw. Verified correct names from OpenClaw
  *   2026.3.7 source (deliver-Draic8X1.js):
  *
@@ -17,49 +17,25 @@
  *   "message:response"             →  "agent_end"
  *   "session:end"                  →  "session_end"
  *
- *   Additionally, event object shapes were wrong. Verified from source:
+ *   BUG FIX 2 — message_received does NOT fire on Web/WebSocket path.
+ *   Verified: Web UI messages go through a different dispatch path that
+ *   does not call runMessageReceived(). User turns were never collected
+ *   when using the Web interface.
  *
- *   message_received event:
- *     event.content   — user message content (string)
- *     event.from      — sender identifier
- *     ctx.sessionKey  — session identifier
- *
- *   agent_end event:
- *     event.messages  — full message history array (role/content pairs)
- *     event.success   — boolean
- *     event.durationMs — number
- *     ctx.sessionKey  — session identifier
- *
- *   session_end event:
- *     ctx.sessionKey  — session identifier
- *     (no content in event itself)
- *
- *   Since agent_end carries the full messages array, we extract the last
- *   assistant message from it rather than reading a responseText field
- *   (which doesn't exist in this hook's event).
- *
- * Main Functionality:
- *   - Hook "message_received" → collect user turn from event.content
- *   - Hook "agent_end" → collect last assistant turn from event.messages
- *   - Hook "session_end" → batch-send all turns to MemChain /log
- *   - Include recall_context for negative feedback correlation
- *   - Mode filtering delegated entirely to MemChainClient.log()
- *
- * Dependencies:
- *   - src/core/client.ts   (MemChainClient — handles mode-aware /log suppression)
- *   - src/core/session-store.ts (SessionStore)
- *   - src/types/memchain.ts (MemChainPluginConfig, Memory)
+ *   Fix: in the agent_end handler, also extract the last user message
+ *   from event.messages[] as a fallback. A dedup check prevents double
+ *   collection when message_received DID fire (e.g. Telegram/WhatsApp).
  *
  * Main Logical Flow:
- *   1. message_received fires when user message arrives
- *      → extract content from event.content
+ *   1. message_received fires when user message arrives (channel path only)
+ *      → extract user content from event.content
  *      → addTurn("user", ...) into SessionStore
- *   2. agent_end fires after LLM finishes full reply
- *      → find last assistant message in event.messages[]
- *      → addTurn("assistant", ...) into SessionStore
- *      → if overflow, emit warn once
+ *   2. agent_end fires after LLM finishes full reply (all paths)
+ *      → extract last USER message from event.messages[] if not already collected
+ *      → extract last ASSISTANT message from event.messages[]
+ *      → addTurn() both into SessionStore (with dedup for user turn)
  *   3. session_end fires when conversation closes
- *      → getTurns() — now has both user + assistant turns
+ *      → getTurns() — has both user + assistant turns
  *      → client.log() — client handles mode-based suppression
  *      → clear() SessionStore
  *
@@ -69,11 +45,11 @@
  *   - Do NOT add mode checks here. Mode filtering lives in client.ts → log().
  *   - recall_context enables negative feedback detection server-side.
  *   - event names use underscores NOT colons: session_end not session:end
- *   - agent_end.messages is the full history — take the LAST assistant entry
- *   - message_received.content is the raw user message string
+ *   - agent_end.messages is the full history — take the LAST entries
+ *   - Web/WebSocket path does NOT fire message_received — use agent_end fallback
  *
- * Last Modified: v0.3.2 — Fixed all three hook event names + event shapes
- *                         (was silently ignored by OpenClaw since v0.1.0)
+ * Last Modified: v0.3.2 — Fixed hook event names + added user turn fallback
+ *                         in agent_end for Web/WebSocket path
  * ============================================
  */
 
@@ -92,19 +68,16 @@ interface PluginLogger {
 // Event type definitions (verified from OpenClaw 2026.3.7 source)
 // ---------------------------------------------------------------------------
 
-/** message_received event — fires when user message arrives */
+/** message_received event — fires when user message arrives (channel path) */
 interface MessageReceivedEvent {
-  /** Raw message content from the user */
   content: string;
-  /** Sender identifier */
   from?: string;
   timestamp?: number;
   metadata?: Record<string, unknown>;
 }
 
-/** agent_end event — fires after LLM finishes full reply */
+/** agent_end event — fires after LLM finishes full reply (all paths) */
 interface AgentEndEvent {
-  /** Full conversation message history including the new assistant reply */
   messages: Array<{
     role: string;
     content: string | Array<{ type: string; text?: string }>;
@@ -128,8 +101,26 @@ interface PluginApi {
   on(
     event: string,
     handler: (event: unknown, ctx: HookCtx) => Promise<void>,
-    options?: { name?: string; description?: string; priority?: number },
+    options?: { name?: string; priority?: number },
   ): void;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function extractText(
+  content: string | Array<{ type: string; text?: string }>,
+): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p.type === "text" && p.text)
+      .map((p) => p.text!.trim())
+      .join(" ")
+      .trim();
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -144,108 +135,108 @@ export function registerLogHook(
   log: PluginLogger,
 ): void {
   // -----------------------------------------------------------------------
-  // Hook 1: Collect USER turns
+  // Hook 1: Collect USER turns via message_received
   //
-  // "message_received" fires when a user message arrives.
-  // event.content contains the raw user message string.
-  //
-  // v0.3.2 FIX: was "message:preprocessed" — doesn't exist in OpenClaw.
-  //             event shape was also wrong (was reading context.body).
+  // Fires on channel paths (Telegram, WhatsApp, etc.) BEFORE LLM responds.
+  // Does NOT fire on Web/WebSocket path — agent_end handles that as fallback.
   // -----------------------------------------------------------------------
   api.on(
     "message_received",
     async (rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
-
       const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return;
 
       const event = rawEvent as MessageReceivedEvent;
-      const content = event?.content;
-      if (!content || typeof content !== "string") return;
-
-      const trimmed = content.trim();
+      const trimmed = (event?.content ?? "").trim();
       if (!trimmed) return;
 
       const { overflow } = sessions.addTurn(sessionKey, {
         role: "user",
         content: trimmed,
       });
-
       if (overflow) {
-        log.warn("[MemChain] Session turn cap reached (200), oldest turns being dropped", {
-          sessionKey,
-          role: "user",
+        log.warn("[MemChain] Session turn cap reached (200), oldest turns dropped", {
+          sessionKey, role: "user",
         });
         sessions.markOverflowWarned(sessionKey);
       }
-
-      log.debug("[MemChain] Turn collected (user)", {
-        sessionKey,
-        length: trimmed.length,
+      log.debug("[MemChain] Turn collected (user via message_received)", {
+        sessionKey, length: trimmed.length,
       });
     },
     { name: "memchain.collect-user-turn" },
   );
 
   // -----------------------------------------------------------------------
-  // Hook 2: Collect ASSISTANT turns
+  // Hook 2: Collect BOTH user and assistant turns via agent_end
   //
-  // "agent_end" fires after the LLM finishes its complete reply.
-  // event.messages contains the full conversation history — we extract
-  // the last message with role "assistant".
+  // Fires after LLM finishes replying on ALL paths including Web/WebSocket.
+  // event.messages contains the full conversation history.
   //
-  // v0.3.2 FIX: was "message:response" — doesn't exist in OpenClaw.
-  //             event shape was also wrong (was reading context.responseText).
+  // User turn: extracted as fallback — dedup check prevents double-collection
+  // when message_received already fired (e.g. Telegram/WhatsApp).
+  //
+  // Assistant turn: always extracted here (no other reliable source).
   // -----------------------------------------------------------------------
   api.on(
     "agent_end",
     async (rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
-
       const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return;
 
       const event = rawEvent as AgentEndEvent;
       if (!event?.messages?.length) return;
 
-      const lastAssistant = [...event.messages]
-        .reverse()
-        .find((m) => m.role === "assistant");
+      const reversed = [...event.messages].reverse();
 
-      if (!lastAssistant) return;
-
-      let text: string;
-      if (typeof lastAssistant.content === "string") {
-        text = lastAssistant.content.trim();
-      } else if (Array.isArray(lastAssistant.content)) {
-        text = lastAssistant.content
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => p.text!.trim())
-          .join(" ")
-          .trim();
-      } else {
-        return;
+      // --- User turn fallback (for Web/WebSocket path) ---
+      const lastUser = reversed.find((m) => m.role === "user");
+      if (lastUser) {
+        const userText = extractText(lastUser.content);
+        if (userText) {
+          const existing = sessions.getTurns(sessionKey);
+          const alreadyCollected = existing.some(
+            (t) => t.role === "user" && t.content === userText,
+          );
+          if (!alreadyCollected) {
+            const { overflow } = sessions.addTurn(sessionKey, {
+              role: "user",
+              content: userText,
+            });
+            if (overflow) {
+              log.warn("[MemChain] Session turn cap reached (200), oldest turns dropped", {
+                sessionKey, role: "user",
+              });
+              sessions.markOverflowWarned(sessionKey);
+            }
+            log.warn("[MemChain] Turn collected (user via agent_end)", {
+              sessionKey, length: userText.length,
+            });
+          }
+        }
       }
 
-      if (!text) return;
+      // --- Assistant turn ---
+      const lastAssistant = reversed.find((m) => m.role === "assistant");
+      if (!lastAssistant) return;
+
+      const assistantText = extractText(lastAssistant.content);
+      if (!assistantText) return;
 
       const { overflow } = sessions.addTurn(sessionKey, {
         role: "assistant",
-        content: text,
+        content: assistantText,
       });
-
       if (overflow) {
-        log.warn("[MemChain] Session turn cap reached (200), oldest turns being dropped", {
-          sessionKey,
-          role: "assistant",
+        log.warn("[MemChain] Session turn cap reached (200), oldest turns dropped", {
+          sessionKey, role: "assistant",
         });
         sessions.markOverflowWarned(sessionKey);
       }
-
-      log.debug("[MemChain] Turn collected (assistant)", {
-        sessionKey,
-        length: text.length,
+      log.warn("[MemChain] Turn collected (assistant)", {
+        sessionKey, length: assistantText.length,
       });
     },
     { name: "memchain.collect-assistant-turn" },
@@ -256,14 +247,11 @@ export function registerLogHook(
   //
   // "session_end" fires when a session closes.
   // ctx.sessionKey identifies which session is ending.
-  //
-  // v0.3.2 FIX: was "session:end" — correct name is "session_end".
   // -----------------------------------------------------------------------
   api.on(
     "session_end",
     async (_rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
-
       const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return;
 
@@ -289,10 +277,6 @@ export function registerLogHook(
           );
         }
 
-        // client.log() is mode-aware:
-        //   local  → POST /api/mpi/log
-        //   remote → silently returns null (403 expected)
-        //   cloud  → silently returns null (403 expected)
         const result = await client.log({
           session_id: sessionId || sessionKey,
           turns,
@@ -311,23 +295,18 @@ export function registerLogHook(
         } else {
           if (cfg.mode === "local") {
             log.warn("[MemChain] Failed to log session — MemChain unavailable", {
-              sessionKey,
-              turnsLost: turns.length,
+              sessionKey, turnsLost: turns.length,
             });
           } else {
             log.debug("[MemChain] /log skipped", {
-              mode: cfg.mode,
-              sessionKey,
-              turnsCollected: turns.length,
+              mode: cfg.mode, sessionKey, turnsCollected: turns.length,
             });
           }
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         log.warn("[MemChain] Log hook failed", {
-          error: message,
-          sessionKey,
-          turnsLost: turns.length,
+          error: message, sessionKey, turnsLost: turns.length,
         });
       } finally {
         sessions.clear(sessionKey);
