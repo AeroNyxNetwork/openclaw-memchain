@@ -6,43 +6,42 @@
  *   to MemChain /log on session end. Rule engine auto-extracts identities,
  *   preferences, allergies, and detects negative feedback.
  *
- * Modification Reason (v0.3.0):
- *   BUG FIX 1 — Only user turns were collected; assistant replies were never
- *   added to the turn buffer. /log was sending one-sided conversations, which
- *   severely degraded the rule engine's entity extraction and negative feedback
- *   detection (both require seeing both sides of the dialogue).
- *
- *   ROOT CAUSE of BUG FIX 1: The previous attempt tried to read assistant
- *   content from event.context.responseText inside message:preprocessed.
- *   That hook fires BEFORE the LLM responds, so responseText is always
- *   undefined at that point. Assistant turns must be collected in a
- *   SEPARATE hook that fires AFTER the LLM responds.
- *
- *   BUG FIX 2 — Cloud mode was being silently skipped at the hook layer
- *   (same early-return as remote mode), but client.ts already handles the
- *   remote/cloud /log suppression internally. Double-suppression meant cloud
- *   mode turns were never collected, making it impossible to add cloud /log
- *   support in the future without changing two places.
- *
- *   BUG FIX 3 — SessionStore.addTurn() now returns { overflow: boolean }.
- *   Hook checks this and emits a warn log once per session when the 200-turn
- *   cap is hit, then marks the session so it doesn't spam the log.
- *
  * Modification Reason (v0.3.2):
- *   BUG FIX — Wrong hook event names. OpenClaw does NOT have
- *   "message:preprocessed", "message:response", or "session:end".
- *   Verified from OpenClaw 2026.3.7 source:
- *     user turn   → "message_received"   (fires when user message arrives)
- *     asst turn   → "agent_end"          (fires after LLM finishes replying)
- *     session end → "session_end"        (fires when session closes)
- *   All three hooks were silently ignored by OpenClaw because the event
- *   names didn't match any known events — that's why "Turn collected" never
- *   appeared in logs and /log only received empty turn arrays.
+ *   BUG FIX — All three hook event names were wrong, causing hooks to be
+ *   silently ignored by OpenClaw. Verified correct names from OpenClaw
+ *   2026.3.7 source (deliver-Draic8X1.js):
+ *
+ *   WRONG (all previous versions)     CORRECT (v0.3.2)
+ *   ─────────────────────────────     ────────────────
+ *   "message:preprocessed"         →  "message_received"
+ *   "message:response"             →  "agent_end"
+ *   "session:end"                  →  "session_end"
+ *
+ *   Additionally, event object shapes were wrong. Verified from source:
+ *
+ *   message_received event:
+ *     event.content   — user message content (string)
+ *     event.from      — sender identifier
+ *     ctx.sessionKey  — session identifier
+ *
+ *   agent_end event:
+ *     event.messages  — full message history array (role/content pairs)
+ *     event.success   — boolean
+ *     event.durationMs — number
+ *     ctx.sessionKey  — session identifier
+ *
+ *   session_end event:
+ *     ctx.sessionKey  — session identifier
+ *     (no content in event itself)
+ *
+ *   Since agent_end carries the full messages array, we extract the last
+ *   assistant message from it rather than reading a responseText field
+ *   (which doesn't exist in this hook's event).
  *
  * Main Functionality:
- *   - Hook "message:preprocessed" → collect user message turns
- *   - Hook "message:preprocessed" → collect assistant reply turns (NEW)
- *   - Hook "session:end" → batch-send turns to MemChain /log
+ *   - Hook "message_received" → collect user turn from event.content
+ *   - Hook "agent_end" → collect last assistant turn from event.messages
+ *   - Hook "session_end" → batch-send all turns to MemChain /log
  *   - Include recall_context for negative feedback correlation
  *   - Mode filtering delegated entirely to MemChainClient.log()
  *
@@ -52,35 +51,29 @@
  *   - src/types/memchain.ts (MemChainPluginConfig, Memory)
  *
  * Main Logical Flow:
- *   1. message_received fires when user message arrives (BEFORE LLM)
- *      → extract user content from event.context.body / transcript
+ *   1. message_received fires when user message arrives
+ *      → extract content from event.content
  *      → addTurn("user", ...) into SessionStore
- *   2. agent_end fires after LLM finishes replying
- *      → extract assistant content from event.context.responseText
+ *   2. agent_end fires after LLM finishes full reply
+ *      → find last assistant message in event.messages[]
  *      → addTurn("assistant", ...) into SessionStore
- *      → if SessionStore.addTurn() returns overflow=true, emit warn once
+ *      → if overflow, emit warn once
  *   3. session_end fires when conversation closes
- *      → getTurns() from SessionStore (now contains both user + assistant)
- *      → build LogRequest with session_id + turns + recall_context
- *      → client.log() — client decides whether to skip based on mode
- *      → clear() SessionStore regardless of success/failure
+ *      → getTurns() — now has both user + assistant turns
+ *      → client.log() — client handles mode-based suppression
+ *      → clear() SessionStore
  *
  * ⚠️ Important Note for Next Developer:
  *   - /log is the SAFETY NET — even if remember-tool isn't called,
  *     the rule engine extracts memories from raw conversation.
  *   - Do NOT add mode checks here. Mode filtering lives in client.ts → log().
- *     Adding it in two places caused the cloud-mode double-suppression bug.
- *   - recall_context enables negative feedback detection on the server side.
- *   - Both user AND assistant turns are required for the rule engine to work.
- *   - VERIFIED event names (OpenClaw 2026.3.7):
- *       user turn   → "message_received"
- *       asst turn   → "agent_end"
- *       session end → "session_end"
- *     Do NOT use "message:preprocessed", "message:response", "session:end"
- *     (colon variants) — they don't exist and are silently ignored.
+ *   - recall_context enables negative feedback detection server-side.
+ *   - event names use underscores NOT colons: session_end not session:end
+ *   - agent_end.messages is the full history — take the LAST assistant entry
+ *   - message_received.content is the raw user message string
  *
- * Last Modified: v0.3.2 — Fixed all three hook event names
- *                         (message_received / agent_end / session_end)
+ * Last Modified: v0.3.2 — Fixed all three hook event names + event shapes
+ *                         (was silently ignored by OpenClaw since v0.1.0)
  * ============================================
  */
 
@@ -95,27 +88,51 @@ interface PluginLogger {
   debug(msg: string, meta?: Record<string, unknown>): void;
 }
 
-interface HookEvent {
-  type: string;
-  action: string;
+// ---------------------------------------------------------------------------
+// Event type definitions (verified from OpenClaw 2026.3.7 source)
+// ---------------------------------------------------------------------------
+
+/** message_received event — fires when user message arrives */
+interface MessageReceivedEvent {
+  /** Raw message content from the user */
+  content: string;
+  /** Sender identifier */
+  from?: string;
+  timestamp?: number;
+  metadata?: Record<string, unknown>;
+}
+
+/** agent_end event — fires after LLM finishes full reply */
+interface AgentEndEvent {
+  /** Full conversation message history including the new assistant reply */
+  messages: Array<{
+    role: string;
+    content: string | Array<{ type: string; text?: string }>;
+    timestamp?: number;
+  }>;
+  success: boolean;
+  error?: string;
+  durationMs?: number;
+}
+
+/** session_end event — fires when session closes (no content fields) */
+interface SessionEndEvent {
+  reason?: string;
+}
+
+/** Hook context — always has sessionKey */
+interface HookCtx {
   sessionKey: string;
-  timestamp: Date;
-  messages: string[];
-  context: {
-    body?: string;
-    transcript?: string;
-    responseText?: string;      // assistant reply — available in agent_end
-    reply?: string;             // alternate field name for assistant reply
-    text?: string;              // alternate field name for user message
-    sessionEntry?: unknown;
-    senderId?: string;
-  };
+  sessionId?: string;
+  agentId?: string;
+  workspaceDir?: string;
+  messageProvider?: string;
 }
 
 interface PluginApi {
   registerHook(
     event: string,
-    handler: (event: HookEvent) => Promise<void>,
+    handler: (event: unknown, ctx: HookCtx) => Promise<void>,
     options?: { name?: string; description?: string },
   ): void;
 }
@@ -134,29 +151,31 @@ export function registerLogHook(
   // -----------------------------------------------------------------------
   // Hook 1: Collect USER turns
   //
-  // "message_received" fires when a user message arrives, BEFORE LLM responds.
-  // v0.3.2 FIX: was "message:preprocessed" — colon variant doesn't exist in
-  // OpenClaw 2026.3.7, so this hook was silently never registered.
+  // "message_received" fires when a user message arrives.
+  // event.content contains the raw user message string.
+  //
+  // v0.3.2 FIX: was "message:preprocessed" — doesn't exist in OpenClaw.
+  //             event shape was also wrong (was reading context.body).
   // -----------------------------------------------------------------------
   api.registerHook(
     "message_received",
-    async (event: HookEvent): Promise<void> => {
+    async (rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
 
-      const sessionKey = event.sessionKey;
+      const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return;
 
-      // Try all known field names for user message content
-      const userContent =
-        event.context?.body ||
-        event.context?.transcript ||
-        event.context?.text;
-      if (!userContent || typeof userContent !== "string") return;
+      const event = rawEvent as MessageReceivedEvent;
+      const content = event?.content;
+      if (!content || typeof content !== "string") return;
 
-      const trimmed = userContent.trim();
+      const trimmed = content.trim();
       if (!trimmed) return;
 
-      const { overflow } = sessions.addTurn(sessionKey, { role: "user", content: trimmed });
+      const { overflow } = sessions.addTurn(sessionKey, {
+        role: "user",
+        content: trimmed,
+      });
 
       if (overflow) {
         log.warn("[MemChain] Session turn cap reached (200), oldest turns being dropped", {
@@ -180,30 +199,51 @@ export function registerLogHook(
   // -----------------------------------------------------------------------
   // Hook 2: Collect ASSISTANT turns
   //
-  // "agent_end" fires after the LLM finishes its full reply.
-  // v0.3.2 FIX: was "message:response" — colon variant doesn't exist in
-  // OpenClaw 2026.3.7, so this hook was silently never registered.
-  // Verified available events from OpenClaw source: agent_end, session_end,
-  // message_received, before_prompt_build, before_agent_start, llm_output.
+  // "agent_end" fires after the LLM finishes its complete reply.
+  // event.messages contains the full conversation history — we extract
+  // the last message with role "assistant".
+  //
+  // v0.3.2 FIX: was "message:response" — doesn't exist in OpenClaw.
+  //             event shape was also wrong (was reading context.responseText).
   // -----------------------------------------------------------------------
   api.registerHook(
     "agent_end",
-    async (event: HookEvent): Promise<void> => {
+    async (rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
 
-      const sessionKey = event.sessionKey;
+      const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return;
 
-      // Try all known field names for assistant reply content
-      const assistantContent =
-        event.context?.responseText ||
-        event.context?.reply;
-      if (!assistantContent || typeof assistantContent !== "string") return;
+      const event = rawEvent as AgentEndEvent;
+      if (!event?.messages?.length) return;
 
-      const trimmed = assistantContent.trim();
-      if (!trimmed) return;
+      // Find the last assistant message in the history
+      const lastAssistant = [...event.messages]
+        .reverse()
+        .find((m) => m.role === "assistant");
 
-      const { overflow } = sessions.addTurn(sessionKey, { role: "assistant", content: trimmed });
+      if (!lastAssistant) return;
+
+      // Content can be string or array of parts
+      let text: string;
+      if (typeof lastAssistant.content === "string") {
+        text = lastAssistant.content.trim();
+      } else if (Array.isArray(lastAssistant.content)) {
+        text = lastAssistant.content
+          .filter((p) => p.type === "text" && p.text)
+          .map((p) => p.text!.trim())
+          .join(" ")
+          .trim();
+      } else {
+        return;
+      }
+
+      if (!text) return;
+
+      const { overflow } = sessions.addTurn(sessionKey, {
+        role: "assistant",
+        content: text,
+      });
 
       if (overflow) {
         log.warn("[MemChain] Session turn cap reached (200), oldest turns being dropped", {
@@ -215,7 +255,7 @@ export function registerLogHook(
 
       log.debug("[MemChain] Turn collected (assistant)", {
         sessionKey,
-        length: trimmed.length,
+        length: text.length,
       });
     },
     {
@@ -227,15 +267,17 @@ export function registerLogHook(
   // -----------------------------------------------------------------------
   // Hook 3: Flush all turns to MemChain /log on session end
   //
-  // v0.3.2 FIX: was "session:end" — correct name is "session_end"
-  //             (underscore, not colon). Colon variant doesn't exist.
+  // "session_end" fires when a session closes.
+  // ctx.sessionKey identifies which session is ending.
+  //
+  // v0.3.2 FIX: was "session:end" — correct name is "session_end".
   // -----------------------------------------------------------------------
   api.registerHook(
     "session_end",
-    async (event: HookEvent): Promise<void> => {
+    async (_rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
 
-      const sessionKey = event.sessionKey;
+      const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return;
 
       const turns = sessions.getTurns(sessionKey);
@@ -263,7 +305,7 @@ export function registerLogHook(
         // client.log() is mode-aware:
         //   local  → POST /api/mpi/log
         //   remote → silently returns null (403 expected)
-        //   cloud  → silently returns null (403 expected, future-proofed)
+        //   cloud  → silently returns null (403 expected)
         const result = await client.log({
           session_id: sessionId || sessionKey,
           turns,
@@ -280,8 +322,6 @@ export function registerLogHook(
             hasRecallContext: !!recallContextJson,
           });
         } else {
-          // null = either mode-suppressed (remote/cloud) or server unavailable
-          // Only warn if local mode, where /log is expected to work
           if (cfg.mode === "local") {
             log.warn("[MemChain] Failed to log session — MemChain unavailable", {
               sessionKey,
@@ -303,7 +343,6 @@ export function registerLogHook(
           turnsLost: turns.length,
         });
       } finally {
-        // Always clear — don't leak session data regardless of outcome
         sessions.clear(sessionKey);
       }
     },
