@@ -16,8 +16,7 @@
  *   content from event.context.responseText inside message:preprocessed.
  *   That hook fires BEFORE the LLM responds, so responseText is always
  *   undefined at that point. Assistant turns must be collected in a
- *   SEPARATE hook that fires AFTER the LLM responds (message:response or
- *   equivalent post-response event).
+ *   SEPARATE hook that fires AFTER the LLM responds.
  *
  *   BUG FIX 2 — Cloud mode was being silently skipped at the hook layer
  *   (same early-return as remote mode), but client.ts already handles the
@@ -28,6 +27,17 @@
  *   BUG FIX 3 — SessionStore.addTurn() now returns { overflow: boolean }.
  *   Hook checks this and emits a warn log once per session when the 200-turn
  *   cap is hit, then marks the session so it doesn't spam the log.
+ *
+ * Modification Reason (v0.3.2):
+ *   BUG FIX — Wrong hook event names. OpenClaw does NOT have
+ *   "message:preprocessed", "message:response", or "session:end".
+ *   Verified from OpenClaw 2026.3.7 source:
+ *     user turn   → "message_received"   (fires when user message arrives)
+ *     asst turn   → "agent_end"          (fires after LLM finishes replying)
+ *     session end → "session_end"        (fires when session closes)
+ *   All three hooks were silently ignored by OpenClaw because the event
+ *   names didn't match any known events — that's why "Turn collected" never
+ *   appeared in logs and /log only received empty turn arrays.
  *
  * Main Functionality:
  *   - Hook "message:preprocessed" → collect user message turns
@@ -42,14 +52,14 @@
  *   - src/types/memchain.ts (MemChainPluginConfig, Memory)
  *
  * Main Logical Flow:
- *   1. message:preprocessed fires BEFORE LLM responds
+ *   1. message_received fires when user message arrives (BEFORE LLM)
  *      → extract user content from event.context.body / transcript
  *      → addTurn("user", ...) into SessionStore
- *   2. message:response (or equivalent post-LLM hook) fires AFTER LLM responds
+ *   2. agent_end fires after LLM finishes replying
  *      → extract assistant content from event.context.responseText
  *      → addTurn("assistant", ...) into SessionStore
  *      → if SessionStore.addTurn() returns overflow=true, emit warn once
- *   3. session:end fires when conversation closes
+ *   3. session_end fires when conversation closes
  *      → getTurns() from SessionStore (now contains both user + assistant)
  *      → build LogRequest with session_id + turns + recall_context
  *      → client.log() — client decides whether to skip based on mode
@@ -62,16 +72,15 @@
  *     Adding it in two places caused the cloud-mode double-suppression bug.
  *   - recall_context enables negative feedback detection on the server side.
  *   - Both user AND assistant turns are required for the rule engine to work.
- *   - CRITICAL: Never try to read responseText in message:preprocessed.
- *     That hook fires before the LLM responds — responseText will always
- *     be undefined/empty at that point. Use a post-response hook instead.
- *   - The hook name for post-LLM response may vary by OpenClaw version.
- *     "message:response" is the documented name as of OpenClaw 2026.3.7.
- *     If assistant turns stop being collected, check if the hook event name
- *     has changed in newer OpenClaw releases.
+ *   - VERIFIED event names (OpenClaw 2026.3.7):
+ *       user turn   → "message_received"
+ *       asst turn   → "agent_end"
+ *       session end → "session_end"
+ *     Do NOT use "message:preprocessed", "message:response", "session:end"
+ *     (colon variants) — they don't exist and are silently ignored.
  *
- * Last Modified: v0.3.0 — Fixed assistant turn collection (wrong hook timing),
- *                         removed duplicate mode-gate, added overflow warning
+ * Last Modified: v0.3.2 — Fixed all three hook event names
+ *                         (message_received / agent_end / session_end)
  * ============================================
  */
 
@@ -95,7 +104,9 @@ interface HookEvent {
   context: {
     body?: string;
     transcript?: string;
-    responseText?: string;      // assistant reply content
+    responseText?: string;      // assistant reply — available in agent_end
+    reply?: string;             // alternate field name for assistant reply
+    text?: string;              // alternate field name for user message
     sessionEntry?: unknown;
     senderId?: string;
   };
@@ -123,18 +134,23 @@ export function registerLogHook(
   // -----------------------------------------------------------------------
   // Hook 1: Collect USER turns
   //
-  // Fires BEFORE the LLM responds (message preprocessing phase).
-  // ONLY collect user content here — responseText is undefined at this point.
+  // "message_received" fires when a user message arrives, BEFORE LLM responds.
+  // v0.3.2 FIX: was "message:preprocessed" — colon variant doesn't exist in
+  // OpenClaw 2026.3.7, so this hook was silently never registered.
   // -----------------------------------------------------------------------
   api.registerHook(
-    "message:preprocessed",
+    "message_received",
     async (event: HookEvent): Promise<void> => {
       if (!cfg.enableAutoLog) return;
 
       const sessionKey = event.sessionKey;
       if (!sessionKey) return;
 
-      const userContent = event.context?.body || event.context?.transcript;
+      // Try all known field names for user message content
+      const userContent =
+        event.context?.body ||
+        event.context?.transcript ||
+        event.context?.text;
       if (!userContent || typeof userContent !== "string") return;
 
       const trimmed = userContent.trim();
@@ -164,23 +180,24 @@ export function registerLogHook(
   // -----------------------------------------------------------------------
   // Hook 2: Collect ASSISTANT turns
   //
-  // Fires AFTER the LLM responds. This is the only correct place to read
-  // responseText — it is always undefined/empty in message:preprocessed
-  // because that hook fires before the LLM has produced a reply.
-  //
-  // ⚠️ If "message:response" is not a valid event in your OpenClaw version,
-  //    check the OpenClaw changelog. As of 2026.3.7 this is the documented
-  //    post-response hook event name.
+  // "agent_end" fires after the LLM finishes its full reply.
+  // v0.3.2 FIX: was "message:response" — colon variant doesn't exist in
+  // OpenClaw 2026.3.7, so this hook was silently never registered.
+  // Verified available events from OpenClaw source: agent_end, session_end,
+  // message_received, before_prompt_build, before_agent_start, llm_output.
   // -----------------------------------------------------------------------
   api.registerHook(
-    "message:response",
+    "agent_end",
     async (event: HookEvent): Promise<void> => {
       if (!cfg.enableAutoLog) return;
 
       const sessionKey = event.sessionKey;
       if (!sessionKey) return;
 
-      const assistantContent = event.context?.responseText;
+      // Try all known field names for assistant reply content
+      const assistantContent =
+        event.context?.responseText ||
+        event.context?.reply;
       if (!assistantContent || typeof assistantContent !== "string") return;
 
       const trimmed = assistantContent.trim();
@@ -208,17 +225,13 @@ export function registerLogHook(
   );
 
   // -----------------------------------------------------------------------
-  // Hook 2: Flush all turns to MemChain /log on session end
+  // Hook 3: Flush all turns to MemChain /log on session end
   //
-  // v0.3.0 FIX: Removed early-return for remote/cloud modes.
-  // Mode filtering is handled entirely inside client.log() — it already
-  // returns null silently for remote and cloud modes. Duplicating the check
-  // here was causing cloud turns to never be collected (data loss), and
-  // would prevent future cloud /log support from working without touching
-  // two files.
+  // v0.3.2 FIX: was "session:end" — correct name is "session_end"
+  //             (underscore, not colon). Colon variant doesn't exist.
   // -----------------------------------------------------------------------
   api.registerHook(
-    "session:end",
+    "session_end",
     async (event: HookEvent): Promise<void> => {
       if (!cfg.enableAutoLog) return;
 
