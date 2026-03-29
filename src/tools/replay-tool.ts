@@ -6,16 +6,30 @@
  *   Developers and users can review what was discussed in past sessions.
  *   Supports encrypted content decryption in remote/cloud modes.
  *
+ * Modification Reason (v0.3.0):
+ *   No logic changes. Added standard modification header block for consistency
+ *   with all other files in the plugin (required by project comment standards).
+ *
+ * Main Functionality:
+ *   - Accept session_id + optional max_turns from LLM tool call
+ *   - GET /sessions/:id/conversation — fetch decrypted turn list
+ *   - GET /sessions/:id — fetch session title + summary for display
+ *   - Format turns into readable output, truncated at 200 chars each
+ *   - Show overflow indicator if turns exceed max_turns
+ *
  * Dependencies:
  *   - src/core/client.ts (MemChainClient.getConversation, .getSession)
  *
  * ⚠️ Important Note for Next Developer:
  *   - Requires MemChain v2.5.0+ (GET /sessions/:id/conversation)
- *   - Encrypted turns show as "(encrypted)" if decryption fails
+ *   - Encrypted turns show as "(encrypted)" if decryption fails at client layer
  *   - Content is truncated to 200 chars per turn for LLM context efficiency
  *   - Use memchain_search to find the session_id first, then replay
+ *   - Two sequential HTTP calls (getConversation + getSession) are intentional:
+ *     getConversation is the primary data source, getSession is metadata only.
+ *     getSession failure should not block the result — it's display-only.
  *
- * Last Modified: v0.3.0 — Initial creation
+ * Last Modified: v0.3.0 — Initial creation + standard comment block added
  * ============================================
  */
 
@@ -75,21 +89,24 @@ export function registerReplayTool(
         const maxTurns = Math.min(Math.max(input.max_turns || 20, 1), 100);
 
         try {
-          // Get conversation turns
+          // Primary: fetch conversation turns
           const convo = await client.getConversation(sessionId);
 
           if (!convo) {
-            return { result: "Conversation replay unavailable — MemChain may not support this feature yet." };
+            return {
+              result:
+                "Conversation replay unavailable — MemChain may not support this feature yet.",
+            };
           }
 
           if (!convo.turns || convo.turns.length === 0) {
             return { result: `No conversation data found for session ${sessionId}.` };
           }
 
-          // Get session details for title/summary
+          // Secondary: fetch session metadata (title + summary) for display only.
+          // Failure here is non-blocking — convo data is the primary result.
           const session = await client.getSession(sessionId);
 
-          // Format output
           const lines: string[] = [];
 
           if (session?.title) {
@@ -105,7 +122,6 @@ export function registerReplayTool(
           lines.push(`**Turns**: ${convo.turn_count}`);
           lines.push("");
 
-          // Show turns (limited to maxTurns)
           const turnsToShow = convo.turns.slice(0, maxTurns);
 
           for (const turn of turnsToShow) {
@@ -115,9 +131,10 @@ export function registerReplayTool(
               lines.push(`${role}: (encrypted — cannot decrypt with current key)`);
             } else if (turn.content) {
               // Truncate long content for LLM context efficiency
-              const preview = turn.content.length > 200
-                ? turn.content.slice(0, 200) + "..."
-                : turn.content;
+              const preview =
+                turn.content.length > 200
+                  ? turn.content.slice(0, 200) + "..."
+                  : turn.content;
               lines.push(`${role}: ${preview}`);
             } else {
               lines.push(`${role}: (empty)`);
