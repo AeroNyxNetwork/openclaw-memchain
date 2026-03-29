@@ -6,16 +6,26 @@
  *   Complements memchain_recall (semantic/vector search) with exact keyword matching.
  *   Better for finding specific terms: "JWT", "Redis", error codes, names.
  *
+ * Modification Reason (v0.3.0):
+ *   BUG FIX — <mark> tag stripping used two separate replacements:
+ *     .replace(/<mark>/g, "**").replace(/<\/mark>/g, "**")
+ *   This produced adjacent bold markers like "**JWT** **Redis**" when multiple
+ *   keywords matched in one snippet. In Markdown, "** **" renders as empty bold
+ *   rather than a space, breaking display in all Markdown-rendering clients.
+ *   Fix: single regex that captures the inner text and wraps it in one bold pair:
+ *     .replace(/<mark>(.*?)<\/mark>/g, "**$1**")
+ *
  * Dependencies:
  *   - src/core/client.ts (MemChainClient.search)
  *
  * ⚠️ Important Note for Next Developer:
  *   - Requires MemChain v2.5.0+ (GET /api/mpi/search)
- *   - Snippets contain <mark> tags — stripped for LLM, kept for UI
- *   - Results are grouped by session for better context
- *   - Falls back gracefully if endpoint not available (older Rust version)
+ *   - <mark> tags are stripped for LLM output — keep the capture-group regex,
+ *     do NOT go back to two separate replacements (see bug above).
+ *   - Results are grouped by session for better context.
+ *   - Falls back gracefully if endpoint not available (older Rust version).
  *
- * Last Modified: v0.3.0 — Initial creation
+ * Last Modified: v0.3.0 — Fixed <mark> regex producing broken Markdown bold
  * ============================================
  */
 
@@ -71,21 +81,16 @@ export function registerSearchTool(
         if (!query) {
           return { result: "No search query provided." };
         }
-
         const limit = Math.min(Math.max(input.limit || 10, 1), 50);
-
         try {
           const result = await client.search(query, limit);
-
           if (!result) {
             return { result: "Search unavailable — MemChain may not support this feature yet." };
           }
-
           if (result.total_results === 0) {
             return { result: `No memories found for "${query}".` };
           }
 
-          // Format results with session grouping
           const lines: string[] = [];
           lines.push(`Found ${result.total_results} results for "${query}":`);
           lines.push("");
@@ -93,10 +98,11 @@ export function registerSearchTool(
           for (const group of result.results) {
             const title = group.session_title || group.session_id.slice(0, 12);
             lines.push(`**${title}**`);
-
             for (const hit of group.hits) {
-              // Strip <mark> tags for LLM, replace with **bold** for emphasis
-              const clean = hit.snippet.replace(/<mark>/g, "**").replace(/<\/mark>/g, "**");
+              // v0.3.0 FIX: was two separate replacements which produced
+              // adjacent "** **" markers for multi-keyword snippets.
+              // Single capture-group regex wraps each match correctly.
+              const clean = hit.snippet.replace(/<mark>(.*?)<\/mark>/g, "**$1**");
               lines.push(`  - ${clean} (score: ${hit.score.toFixed(1)})`);
             }
             lines.push("");
@@ -106,7 +112,6 @@ export function registerSearchTool(
             query: query.slice(0, 50),
             totalResults: result.total_results,
           });
-
           return { result: lines.join("\n") };
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
