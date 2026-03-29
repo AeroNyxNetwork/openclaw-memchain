@@ -30,7 +30,7 @@ When you install this plugin, your OpenClaw agent will:
 
 | Requirement | Version | Why |
 |---|---|---|
-| **OpenClaw** | `>= 2026.3.7` | Uses `before_prompt_build` hook with `prependSystemContext` and ContextEngine plugin slot |
+| **OpenClaw** | `>= 2026.3.7` | Uses `before_prompt_build`, `message:preprocessed`, `message:response` hooks |
 | **AeroNyx Server** | `>= 2.1.0+Embed` | Provides MemChain MPI endpoints + local MiniLM embedding engine |
 | **Node.js** | `>= 22` | Matches OpenClaw's runtime requirement; uses built-in `fetch` |
 
@@ -61,7 +61,7 @@ openclaw plugins install @aeronyx/openclaw-memchain
 openclaw skills install @aeronyx/openclaw-memchain/skills/memchain-memory
 ```
 
-The skill teaches your agent when and how to use `memchain_remember`, `memchain_recall`, and `memchain_forget` tools. Without it, automatic recall and logging still work, but the agent won't proactively store memories.
+The skill teaches your agent when and how to use the MemChain tools. Without it, automatic recall and logging still work, but the agent won't proactively store memories.
 
 ### Step 4: Restart Gateway
 
@@ -92,6 +92,15 @@ All settings have sensible defaults for local deployment. Override via CLI:
 # Change MemChain URL (if running on different host/port)
 openclaw config set plugins.entries.aeronyx-memchain.config.memchainUrl "http://192.168.1.100:8421"
 
+# Use remote mode (Ed25519 + E2E encryption)
+openclaw config set plugins.entries.aeronyx-memchain.config.mode "remote"
+openclaw config set plugins.entries.aeronyx-memchain.config.nodeUrl "http://node-ip:8421"
+
+# Use cloud mode (CMS relay)
+openclaw config set plugins.entries.aeronyx-memchain.config.mode "cloud"
+openclaw config set plugins.entries.aeronyx-memchain.config.cmsUrl "https://api.aeronyx.network"
+openclaw config set plugins.entries.aeronyx-memchain.config.apiKey "sk-xxx"
+
 # Increase token budget for more memory context
 openclaw config set plugins.entries.aeronyx-memchain.config.tokenBudget 3000
 
@@ -103,8 +112,13 @@ openclaw config set plugins.entries.aeronyx-memchain.config.enableAutoRecall fal
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `memchainUrl` | string | `http://127.0.0.1:8421` | MemChain MPI endpoint URL |
-| `embeddingModel` | string | `minilm-l6-v2` | Embedding model identifier (must match MemChain server) |
+| `mode` | string | `local` | Operating mode: `local`, `remote`, or `cloud` |
+| `memchainUrl` | string | `http://127.0.0.1:8421` | MemChain MPI endpoint URL (local mode) |
+| `nodeUrl` | string | `""` | Remote node URL (remote mode only) |
+| `cmsUrl` | string | `https://api.aeronyx.network` | CMS relay URL (cloud mode only) |
+| `apiKey` | string | `""` | Bearer token sk-xxx (cloud mode only) |
+| `keyStorePath` | string | `~/.openclaw/memchain-keys.json` | Ed25519 key file (remote/cloud) |
+| `embeddingModel` | string | `minilm-l6-v2` | Embedding model (must match MemChain server) |
 | `sourceAi` | string | `openclaw-memchain` | Source identifier for remember/log calls |
 | `tokenBudget` | number | `2000` | Max tokens for recall context in system prompt (100-8000) |
 | `recallTopK` | number | `10` | Max memories per recall (1-50) |
@@ -122,16 +136,20 @@ openclaw config set plugins.entries.aeronyx-memchain.config.enableAutoRecall fal
 User sends message (WhatsApp / Telegram / Slack / ...)
        │
        ▼
-  message:preprocessed ──→ [log-hook] collects turn
+  message:preprocessed ──→ [log-hook] collects USER turn
        │
        ▼
   before_prompt_build  ──→ [recall-hook]
        │                       │
+       │                   GET /api/mpi/context/inject (v2.5.0+, optional)
+       │                       → project context + session summaries + entities
        │                   POST /api/mpi/embed (user message → 384d vector)
-       │                   POST /api/mpi/recall (vector → ranked memories)
+       │                   POST /api/mpi/recall (vector + query → ranked memories)
        │                       │
        │                   prependSystemContext:
-       │                   "[MemChain] What you know about this user:
+       │                   "## Project: Alpha
+       │                    ...
+       │                    [MemChain] What you know about this user:
        │                    Core identity:
        │                    - User name is Alice
        │                    Preferences & knowledge:
@@ -142,15 +160,20 @@ User sends message (WhatsApp / Telegram / Slack / ...)
        ▼
   LLM generates response (with memory context)
        │
-       ├── Agent may call memchain_remember ──→ POST /api/mpi/remember
+       ├── Agent may call memchain_remember  ──→ POST /api/mpi/remember
+       ├── Agent may call memchain_search    ──→ GET  /api/mpi/search
+       ├── Agent may call memchain_replay    ──→ GET  /api/mpi/sessions/:id/conversation
        │
        ▼
   Response sent to user
        │
        ▼
+  message:response ──→ [log-hook] collects ASSISTANT turn
+       │
+       ▼
   session:end ──→ [log-hook]
                       │
-                  POST /api/mpi/log (all turns + recall_context)
+                  POST /api/mpi/log (user + assistant turns + recall_context)
                       │
                   Rule engine auto-extracts:
                   • P2: "I am..." → identity
@@ -174,7 +197,7 @@ Identity memories always appear first in recall results, regardless of embedding
 
 ### Cognitive Scoring (MVF)
 
-Recall ranking is not just vector similarity. MemChain uses a 9-dimensional feature vector:
+Recall ranking uses a 9-dimensional feature vector:
 
 ```
 φ₀ = cos(embed(memory), embed(query))     semantic similarity
@@ -192,7 +215,7 @@ Recall ranking is not just vector similarity. MemChain uses a 9-dimensional feat
 
 ## Agent Tools
 
-The plugin registers three tools the agent can use during conversations:
+The plugin registers 5 tools the agent can use during conversations:
 
 ### `memchain_remember`
 
@@ -209,7 +232,7 @@ Agent calls: memchain_remember({
 
 ### `memchain_recall`
 
-Explicitly search memories. Used for "what do you know about me?" queries and pre-forget lookup.
+Explicitly search memories by semantic similarity.
 
 ```
 Agent calls: memchain_recall({ query: "user health conditions" })
@@ -229,6 +252,31 @@ Agent calls: memchain_forget({ record_id: "557014a3..." })
 → "Memory 557014a3... has been permanently deleted."
 ```
 
+### `memchain_search`
+
+BM25 keyword search across all memories. Better for exact terms.
+
+```
+Agent calls: memchain_search({ query: "JWT authentication" })
+→ "Found 3 results for "JWT authentication":
+   **Session: MemChain integration**
+   - User implemented **JWT** auth with RS256 (score: 4.2)
+   ..."
+```
+
+### `memchain_replay`
+
+Replay a previous conversation session.
+
+```
+Agent calls: memchain_replay({ session_id: "oc-18f3a2b1-4c7d8e9f" })
+→ "**Session**: MemChain integration
+   **Summary**: Discussed JWT auth and plugin setup
+   **Turns**: 12
+   👤 User: How do I set up Ed25519 signing?
+   🤖 Assistant: Here's how to generate keys..."
+```
+
 ---
 
 ## Graceful Degradation
@@ -239,10 +287,13 @@ This plugin is designed to never break your OpenClaw agent:
 |---|---|
 | MemChain not running | All hooks return empty, agent works without memory |
 | MemChain starts after gateway | Next recall/log will work automatically |
+| context/inject unavailable (older server) | Skipped silently, recall still works |
 | Embed endpoint down | Recall skipped for that turn, no crash |
 | /recall times out | Agent responds without memory context |
-| /log fails | Session data cleared, no memory leak |
+| /log fails (local) | Session data cleared, no memory leak |
+| /log skipped (remote/cloud) | Expected — use memchain_remember tool |
 | /remember fails | Agent tells user "will be captured via log" |
+| Session exceeds 200 turns | Oldest turns dropped with one-time warning |
 
 ---
 
@@ -251,20 +302,14 @@ This plugin is designed to never break your OpenClaw agent:
 ### Plugin not showing in `openclaw plugins list`
 
 ```bash
-# Verify installation
 npm ls -g @aeronyx/openclaw-memchain
-
-# Reinstall
 openclaw plugins install @aeronyx/openclaw-memchain --force
 ```
 
 ### "🧠 MemChain: UNREACHABLE" in logs
 
 ```bash
-# Check if AeroNyx server is running
 curl http://127.0.0.1:8421/api/mpi/status
-
-# Check configured URL
 openclaw config get plugins.entries.aeronyx-memchain.config.memchainUrl
 ```
 
@@ -282,9 +327,25 @@ curl -X POST http://127.0.0.1:8421/api/mpi/recall \
   -d '{"top_k":10}'
 ```
 
-### Agent not using memchain_remember
+### /log not capturing both sides of conversation
 
-Ensure the skill is installed:
+```bash
+# Check that BOTH user and assistant turns are logged (v0.3.1+)
+curl -s "http://127.0.0.1:8421/api/mpi/sessions/<session_id>/conversation" \
+  | jq '.turns[] | .role'
+# Expected: "user" and "assistant" entries
+
+# Verify message:response hook is firing in gateway logs
+tail -f /tmp/openclaw-999/openclaw-$(date +%Y-%m-%d).log \
+  | grep "Turn collected"
+# Expected: both (user) and (assistant) log lines
+```
+
+### memchain_forget always returns "No record_id provided"
+
+This was a bug in versions before v0.3.1. Update to v0.3.1 or later.
+
+### Agent not using memchain_remember
 
 ```bash
 openclaw skills list | grep memchain
@@ -297,7 +358,7 @@ openclaw skills install @aeronyx/openclaw-memchain/skills/memchain-memory
 
 ```bash
 # Clone
-git clone https://github.com/AeroNyx/openclaw-memchain.git
+git clone https://github.com/AeroNyxNetwork/openclaw-memchain.git
 cd openclaw-memchain
 
 # Install dependencies
@@ -323,19 +384,21 @@ aeronyx-openclaw-memchain/
 │   ├── index.ts                    # Plugin entry — wires hooks + tools
 │   ├── config.ts                   # JSON Schema for plugin configuration
 │   ├── types/
-│   │   └── memchain.ts             # MPI type definitions (6 endpoints)
+│   │   └── memchain.ts             # MPI type definitions (all endpoints)
 │   ├── core/
-│   │   ├── client.ts               # MemChain HTTP client (zero dependencies)
+│   │   ├── client.ts               # MemChain HTTP client (3 modes, zero deps)
 │   │   ├── session-store.ts        # In-memory session state (TTL cleanup)
 │   │   └── formatter.ts            # Recall results → system prompt text
 │   ├── hooks/
-│   │   ├── recall-hook.ts          # before_prompt_build → embed → recall → inject
-│   │   ├── log-hook.ts             # message:preprocessed + session:end → /log
-│   │   └── health-hook.ts          # First session → health check + status log
+│   │   ├── recall-hook.ts          # before_prompt_build → context/inject → embed → recall → inject
+│   │   ├── log-hook.ts             # preprocessed(user) + response(assistant) + end → /log
+│   │   └── health-hook.ts          # session:start → health check + NER/graph status
 │   └── tools/
 │       ├── remember-tool.ts        # memchain_remember — agent stores memories
 │       ├── forget-tool.ts          # memchain_forget — user-requested deletion
-│       └── recall-tool.ts          # memchain_recall — explicit memory search
+│       ├── recall-tool.ts          # memchain_recall — semantic memory search
+│       ├── search-tool.ts          # memchain_search — BM25 keyword search
+│       └── replay-tool.ts          # memchain_replay — conversation replay
 ├── skills/
 │   └── memchain-memory/
 │       └── SKILL.md                # Teaches agent when/how to use MemChain tools
@@ -343,6 +406,39 @@ aeronyx-openclaw-memchain/
     └── memchain-lifecycle/
         └── HOOK.md                 # Hook metadata for OpenClaw discovery
 ```
+
+---
+
+## Changelog
+
+### v0.3.1 (2026-03-29) — Code Review & Bug Fixes
+- **Fixed**: `memchain_forget` always returned "No record_id provided" — `execute()` was missing its first `_toolCallId` argument
+- **Fixed**: `/log` only captured user turns — assistant turns require `message:response` hook, not `message:preprocessed`
+- **Fixed**: Cloud mode turns were never collected — removed duplicate mode gate in log-hook
+- **Fixed**: `client.recall()` missing `query` field — server-side hybrid retrieval was degraded
+- **Fixed**: `config.ts` mode enum missing `"cloud"` — cloud config silently fell back to local
+- **Fixed**: `search-tool.ts` `<mark>` replacement produced broken Markdown bold markers
+- **Fixed**: All normal operational logs were at `warn` level — now correctly `debug`/`info`
+- **Fixed**: `getContextInjection` catch block was completely silent — now logs at `debug`
+- **Added**: `session-store.ts` overflow warning (one-time per session, not silent)
+- **Added**: `types/memchain.ts` v2.5.0 status fields + `RecallRequest.query/mode`
+
+### v0.3.0 (2026-03-11)
+- Cloud mode: CMS relay + Ed25519 + E2E encryption
+- New tools: `memchain_search` (BM25) + `memchain_replay` (conversation replay)
+- `/context/inject` integration in recall-hook
+- v2.5.0 NER/graph/SuperNode status display in health-hook
+
+### v0.2.0 (2026-03-10)
+- Remote mode: Ed25519 request signing + ChaCha20-Poly1305 E2E encryption
+- Key management: auto-generate Ed25519 key pair on first startup
+
+### v0.1.3 (2026-03-10)
+- Full pipeline validation: recall + remember tool + /log rule engine
+- Fixed: `registerTool` API — `names` (plural) + `execute(_toolCallId, params)`
+
+### v0.1.0 (2026-03-08)
+- Initial release: recall-hook + log-hook + health-hook + 3 tools
 
 ---
 
@@ -354,7 +450,7 @@ MIT — same as OpenClaw.
 
 ## Links
 
-- [AeroNyx MemChain Architecture](./ARCHITECTURE.md)
+- [Architecture Deep Dive](./ARCHITECTURE.md)
 - [AeroNyx Server](https://github.com/AeroNyx/aeronyx)
 - [OpenClaw Plugin SDK](https://docs.openclaw.ai/tools/plugin)
 - [MemChain MPI Protocol](https://github.com/AeroNyx/aeronyx/blob/main/docs/mpi.md)
