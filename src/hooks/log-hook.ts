@@ -115,11 +115,6 @@ interface AgentEndEvent {
   durationMs?: number;
 }
 
-/** session_end event — fires when session closes (no content fields) */
-interface SessionEndEvent {
-  reason?: string;
-}
-
 /** Hook context — always has sessionKey */
 interface HookCtx {
   sessionKey: string;
