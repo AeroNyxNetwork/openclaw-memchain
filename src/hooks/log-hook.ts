@@ -6,7 +6,7 @@
  *   to MemChain /log on session end. Rule engine auto-extracts identities,
  *   preferences, allergies, and detects negative feedback.
  *
- * Modification Reason (v0.3.2):
+ * Modification Reason (v0.3.3):
  *   BUG FIX — All three hook event names were wrong, causing hooks to be
  *   silently ignored by OpenClaw. Verified correct names from OpenClaw
  *   2026.3.7 source (deliver-Draic8X1.js):
