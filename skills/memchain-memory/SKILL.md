@@ -21,9 +21,13 @@ corrections, and automatically extracts information from conversations.
   are injected into your context. You will see a `[MemChain]` block with
   identity, preferences, and recent context. Use this naturally.
 
-- **Logging**: After each conversation, the full dialogue is sent to MemChain's
-  rule engine, which automatically extracts identities, preferences, allergies,
-  and detects when the user corrects you.
+- **Project Context**: When available, a `## Project` block appears above the
+  memory block, showing recent session summaries and key entities. Use this
+  to stay oriented within an ongoing project.
+
+- **Logging**: After each conversation, both your messages and the user's
+  messages are sent to MemChain's rule engine, which automatically extracts
+  identities, preferences, allergies, and detects when the user corrects you.
 
 ## When to Use `memchain_remember`
 
@@ -112,8 +116,8 @@ Workflow:
 3. Present the key points from the conversation
 
 ```
-memchain_replay({ session_id: "alpha_001" })
-memchain_replay({ session_id: "abc123", max_turns: 10 })
+memchain_replay({ session_id: "oc-18f3a2b1-4c7d8e9f" })
+memchain_replay({ session_id: "oc-18f3a2b1-4c7d8e9f", max_turns: 10 })
 ```
 
 ## When to Use `memchain_recall`
@@ -133,44 +137,63 @@ memchain_recall({ query: "programming preferences" })
 
 **Only when the user explicitly asks to forget something.** Always follow this workflow:
 
-1. Use `memchain_recall` to find the relevant memory
+1. Use `memchain_recall` to find the relevant memory and get its `record_id`
 2. Show the user what you found: "I found this memory: '[content]'. Delete it?"
-3. Wait for user confirmation
+3. Wait for explicit user confirmation
 4. Call `memchain_forget` with the `record_id` from the recall result
 
 **Never forget memories without explicit user request and confirmation.**
 
+```
+memchain_forget({ record_id: "557014a3..." })
+```
+
 ## Important Behavioral Rules
 
 1. **Don't parrot memories**: If you know the user's name is Alice from
-   [MemChain] context, just use it naturally. Don't say "I remember your
-   name is Alice."
+   the `[MemChain]` context, just use it naturally. Don't say "I remember
+   your name is Alice."
 
 2. **Trust current over remembered**: If a memory says "User prefers Python"
    but the user just said "I switched to Rust", trust the current statement
-   and use `memchain_remember` to update the knowledge.
+   and use `memchain_remember` to update the knowledge layer.
 
 3. **Don't over-remember**: Not every message needs to be stored. Only
-   remember information that has long-term value. "What's the weather?"
-   is not worth remembering. "I moved to Tokyo" is.
+   remember information with long-term value. "What's the weather?" is
+   not worth remembering. "I moved to Tokyo" is.
 
 4. **Corrections are automatic**: When the user says "That's wrong" or
    "Actually, it's...", the /log rule engine detects this and penalizes
-   the incorrect memory. You don't need to manually handle corrections.
+   the incorrect memory automatically. You don't need to handle this manually.
 
 5. **Dedup is automatic**: If you're unsure whether something is already
-   remembered, just call `memchain_remember` — MemChain will detect
-   duplicates and skip them (Identity: cosine > 0.92, Knowledge: > 0.88).
+   remembered, just call `memchain_remember` — MemChain detects duplicates
+   and skips them (Identity: cosine > 0.92, Knowledge: > 0.88).
+
+6. **Use search for keywords, recall for concepts**: When the user asks
+   about a specific term ("find JWT"), use `memchain_search`. When they
+   ask about a concept ("what do you know about my auth setup"), use
+   `memchain_recall`.
 
 ## Privacy Controls
 
 Users can use privacy tags in their messages to control what gets stored:
 
-- `<no-mem>sensitive info</no-mem>` — Content inside will NOT be stored in MemChain at all
-- `<private>private note</private>` — Content will be stored but excluded from recall results
+- `<no-mem>sensitive info</no-mem>` — Content inside will NOT be stored in MemChain
+- `<private>private note</private>` — Content stored but excluded from recall results
 
 Example: "My API key is <no-mem>sk-abc123</no-mem>, please help me configure it."
 
 When you see these tags, respect them — do NOT include the tagged content in
 your `memchain_remember` calls. The /log rule engine handles tag stripping
-automatically, but if you're manually remembering, you must strip them yourself.
+automatically, but if you're manually remembering, strip them yourself.
+
+## Tool Summary
+
+| Tool | When to Use | Input |
+|---|---|---|
+| `memchain_remember` | User shares long-term info | content, layer, topic_tags |
+| `memchain_recall` | Find memories by concept | query, top_k |
+| `memchain_forget` | User explicitly requests deletion | record_id |
+| `memchain_search` | Find memories by exact keyword | query, limit |
+| `memchain_replay` | Review a past conversation | session_id, max_turns |
