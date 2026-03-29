@@ -125,10 +125,10 @@ interface HookCtx {
 }
 
 interface PluginApi {
-  registerHook(
+  on(
     event: string,
     handler: (event: unknown, ctx: HookCtx) => Promise<void>,
-    options?: { name?: string; description?: string },
+    options?: { name?: string; description?: string; priority?: number },
   ): void;
 }
 
@@ -152,7 +152,7 @@ export function registerLogHook(
   // v0.3.2 FIX: was "message:preprocessed" — doesn't exist in OpenClaw.
   //             event shape was also wrong (was reading context.body).
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "message_received",
     async (rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
@@ -185,10 +185,7 @@ export function registerLogHook(
         length: trimmed.length,
       });
     },
-    {
-      name: "memchain.collect-user-turn",
-      description: "Collect user messages for MemChain /log rule engine",
-    },
+    { name: "memchain.collect-user-turn" },
   );
 
   // -----------------------------------------------------------------------
@@ -201,7 +198,7 @@ export function registerLogHook(
   // v0.3.2 FIX: was "message:response" — doesn't exist in OpenClaw.
   //             event shape was also wrong (was reading context.responseText).
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "agent_end",
     async (rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
@@ -212,14 +209,12 @@ export function registerLogHook(
       const event = rawEvent as AgentEndEvent;
       if (!event?.messages?.length) return;
 
-      // Find the last assistant message in the history
       const lastAssistant = [...event.messages]
         .reverse()
         .find((m) => m.role === "assistant");
 
       if (!lastAssistant) return;
 
-      // Content can be string or array of parts
       let text: string;
       if (typeof lastAssistant.content === "string") {
         text = lastAssistant.content.trim();
@@ -253,10 +248,7 @@ export function registerLogHook(
         length: text.length,
       });
     },
-    {
-      name: "memchain.collect-assistant-turn",
-      description: "Collect assistant replies for MemChain /log rule engine",
-    },
+    { name: "memchain.collect-assistant-turn" },
   );
 
   // -----------------------------------------------------------------------
@@ -267,7 +259,7 @@ export function registerLogHook(
   //
   // v0.3.2 FIX: was "session:end" — correct name is "session_end".
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "session_end",
     async (_rawEvent: unknown, ctx: HookCtx): Promise<void> => {
       if (!cfg.enableAutoLog) return;
@@ -341,9 +333,6 @@ export function registerLogHook(
         sessions.clear(sessionKey);
       }
     },
-    {
-      name: "memchain.session-log",
-      description: "Flush conversation turns to MemChain /log on session end",
-    },
+    { name: "memchain.session-log" },
   );
 }
